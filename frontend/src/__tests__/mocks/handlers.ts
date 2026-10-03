@@ -262,6 +262,7 @@ export const handlers = [
       ams_humidity_fair: 60,
       ams_temp_good: 30,
       ams_temp_fair: 35,
+      ams_temp_alarm: null,
     });
   }),
 
@@ -381,6 +382,11 @@ export const handlers = [
   // ========================================================================
   // Version / Health
   // ========================================================================
+
+  // Announcements from the maintainers: none by default.
+  http.get('/api/v1/announcements', () => {
+    return HttpResponse.json({ visible: true, announcements: [] });
+  }),
 
   http.get('/api/v1/version', () => {
     return HttpResponse.json({

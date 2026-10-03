@@ -252,6 +252,62 @@ describe('EditArchiveModal', () => {
         expect(patched?.failure_reason).toBe('cloggedNozzle');
       });
     });
+
+    // A value outside the vocabulary used to initialise the dropdown to '',
+    // and saving from that state wrote the empty selection over the stored
+    // text -- opening the editor and pressing Save destroyed the
+    // classification. The startup migration folds every known spelling onto a
+    // key, so what reaches here is genuinely unrecognisable text; it has to
+    // survive rather than be silently discarded (issue #2974).
+    const freeTextArchive = {
+      ...mockArchive,
+      status: 'failed',
+      failure_reason: 'Custom legacy reason',
+    };
+
+    it('keeps a stored value it cannot map, as its own option', () => {
+      render(<EditArchiveModal archive={freeTextArchive} onClose={mockOnClose} onSave={mockOnSave} />);
+      const select = screen.getByLabelText(/failure reason/i) as HTMLSelectElement;
+      expect(select.value).toBe('Custom legacy reason');
+      expect(
+        screen.getByRole('option', { name: 'Custom legacy reason' }),
+      ).toBeInTheDocument();
+    });
+
+    it('does not clear an unmappable reason on an untouched save', async () => {
+      const user = userEvent.setup();
+      let patched: { failure_reason?: string } | undefined;
+      server.use(
+        http.patch('/api/v1/archives/:id', async ({ request }) => {
+          patched = (await request.json()) as { failure_reason?: string };
+          return HttpResponse.json({ ...freeTextArchive, ...patched });
+        }),
+      );
+
+      render(<EditArchiveModal archive={freeTextArchive} onClose={mockOnClose} onSave={mockOnSave} />);
+      await user.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => {
+        expect(patched?.failure_reason).toBe('Custom legacy reason');
+      });
+    });
+
+    it('offers the stale-path reason the backend now writes', () => {
+      // Both stale writers in main.py store `noStatusUpdate`. If it were
+      // missing from the dropdown the editor would treat it as unmappable and
+      // show the raw key to the user instead of a translated label.
+      const staleArchive = {
+        ...mockArchive,
+        status: 'failed',
+        failure_reason: 'noStatusUpdate',
+      };
+      render(<EditArchiveModal archive={staleArchive} onClose={mockOnClose} onSave={mockOnSave} />);
+      const select = screen.getByLabelText(/failure reason/i) as HTMLSelectElement;
+      expect(select.value).toBe('noStatusUpdate');
+      expect(
+        screen.getByRole('option', { name: 'No status update received' }),
+      ).toBeInTheDocument();
+    });
   });
 
   describe('filament grams (#1820)', () => {
@@ -462,6 +518,201 @@ describe('EditArchiveModal', () => {
       // project is what makes the field honest, and it must not also change
       // what an untouched save writes.
       await waitFor(() => expect(seen.body?.project_id).toBe(2));
+    });
+  });
+  describe('items printed (#3051)', () => {
+    // A plate that jammed and came off ruined produced nothing, even when the
+    // printer called the job a success. The project's completed-items count
+    // sums this column, so 0 has to be typeable.
+
+    function patchSpy() {
+      const seen: { body?: Record<string, unknown> } = {};
+      server.use(
+        http.patch('/api/v1/archives/:id', async ({ request }) => {
+          seen.body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockArchive, ...seen.body });
+        }),
+      );
+      return seen;
+    }
+
+    it('sends 0 for a plate that produced nothing', async () => {
+      const user = userEvent.setup();
+      const seen = patchSpy();
+
+      render(
+        <EditArchiveModal
+          archive={{ ...mockArchive, quantity: 4 }}
+          onClose={mockOnClose}
+          onSave={mockOnSave}
+        />,
+      );
+      const field = screen.getByLabelText(/items printed/i) as HTMLInputElement;
+      await user.clear(field);
+      await user.type(field, '0');
+      await user.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(seen.body?.quantity).toBe(0));
+    });
+
+    it('does not floor a cleared field back to 1', async () => {
+      const user = userEvent.setup();
+
+      render(
+        <EditArchiveModal
+          archive={{ ...mockArchive, quantity: 4 }}
+          onClose={mockOnClose}
+          onSave={mockOnSave}
+        />,
+      );
+      const field = screen.getByLabelText(/items printed/i) as HTMLInputElement;
+      await user.clear(field);
+      // Empty while editing (#3182), and 0 rather than 1 once the field is left.
+      expect(field.value).toBe('');
+      await user.tab();
+
+      expect(field.value).toBe('0');
+    });
+
+    it('still refuses a negative count', async () => {
+      const user = userEvent.setup();
+      const seen = patchSpy();
+
+      render(
+        <EditArchiveModal
+          archive={{ ...mockArchive, quantity: 4 }}
+          onClose={mockOnClose}
+          onSave={mockOnSave}
+        />,
+      );
+      const field = screen.getByLabelText(/items printed/i) as HTMLInputElement;
+      await user.clear(field);
+      await user.type(field, '-3');
+      await user.click(screen.getByRole('button', { name: /save/i }));
+
+      expect(field.value).toBe('0');
+      await waitFor(() => expect(seen.body?.quantity).toBe(0));
+    });
+  });
+
+  // Post-print outcome confirmation (#1898)
+  describe('outcome verdict source', () => {
+    const completed = {
+      ...mockArchive,
+      status: 'completed',
+      user_verdict: 'good',
+      confirm_requested: true,
+    };
+
+    it('explains a verdict the plate-clear default recorded', () => {
+      render(
+        <EditArchiveModal
+          archive={{ ...completed, user_verdict_source: 'plate_clear' }}
+          onClose={mockOnClose}
+          onSave={mockOnSave}
+        />,
+      );
+
+      expect(screen.getByTestId('verdict-source-hint')).toHaveTextContent(
+        'Recorded when the plate was cleared.',
+      );
+    });
+
+    it('shows no hint for a verdict with no recorded source', () => {
+      render(
+        <EditArchiveModal
+          archive={{ ...completed, user_verdict_source: null }}
+          onClose={mockOnClose}
+          onSave={mockOnSave}
+        />,
+      );
+
+      expect(screen.queryByTestId('verdict-source-hint')).not.toBeInTheDocument();
+    });
+
+    it('stamps the dialog as the source when the verdict is changed here', async () => {
+      const user = userEvent.setup();
+      let seen: Record<string, unknown> | null = null;
+      server.use(
+        http.patch('/api/v1/archives/:id', async ({ request }) => {
+          seen = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...completed, ...seen });
+        }),
+      );
+
+      render(
+        <EditArchiveModal
+          archive={{ ...completed, user_verdict_source: 'plate_clear' }}
+          onClose={mockOnClose}
+          onSave={mockOnSave}
+        />,
+      );
+
+      await user.selectOptions(screen.getByLabelText(/outcome verdict/i), 'reject');
+      await user.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(seen).not.toBeNull());
+      expect(seen!.user_verdict).toBe('reject');
+      expect(seen!.user_verdict_source).toBe('dialog');
+    });
+  });
+
+  describe('failure_reason on a machine status the dropdown cannot show', () => {
+    // The reject reason (#1898) reuses failure_reason, so the clearing branch
+    // grew "|| archive.failure_reason" to drop it when the verdict goes away.
+    // That clause also catches a 'cancelled' archive: print_queue writes
+    // status 'cancelled' with "Stopped by user (printer was offline)" when a
+    // stop is issued to an offline printer, the status dropdown has no
+    // 'cancelled' option, and so opening the editor and pressing Save with
+    // nothing touched wiped a reason the user could not put back.
+    const cancelled = {
+      ...mockArchive,
+      status: 'cancelled',
+      failure_reason: 'Stopped by user (printer was offline)',
+      user_verdict: null,
+    };
+
+    it('keeps the machine-written reason on an untouched save', async () => {
+      const user = userEvent.setup();
+      let seen: Record<string, unknown> | null = null;
+      server.use(
+        http.patch('/api/v1/archives/:id', async ({ request }) => {
+          seen = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...cancelled, ...seen });
+        }),
+      );
+
+      render(<EditArchiveModal archive={cancelled} onClose={mockOnClose} onSave={mockOnSave} />);
+      await user.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(seen).not.toBeNull());
+      expect(seen!).not.toHaveProperty('failure_reason');
+    });
+
+    it('still drops the reason when a reject verdict is taken back', async () => {
+      // The behaviour the clause was written for, on the archive it was
+      // written for: a completed print whose reject reason no longer applies.
+      const user = userEvent.setup();
+      let seen: Record<string, unknown> | null = null;
+      const rejected = {
+        ...mockArchive,
+        status: 'completed',
+        user_verdict: 'reject',
+        failure_reason: 'warping',
+      };
+      server.use(
+        http.patch('/api/v1/archives/:id', async ({ request }) => {
+          seen = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...rejected, ...seen });
+        }),
+      );
+
+      render(<EditArchiveModal archive={rejected} onClose={mockOnClose} onSave={mockOnSave} />);
+      await user.selectOptions(screen.getByLabelText(/outcome verdict/i), 'good');
+      await user.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(seen).not.toBeNull());
+      expect(seen!.failure_reason).toBeNull();
     });
   });
 });

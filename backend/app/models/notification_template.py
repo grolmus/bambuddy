@@ -56,6 +56,20 @@ DEFAULT_TEMPLATES = [
         "body_template": "{printer}: {filename}\nRemaining: {remaining_time}",
     },
     {
+        # Post-print outcome confirmation (#1898). The body carries
+        # {confirm_url}, which only opens the archive in Bambuddy: anything
+        # that walks a URL out of a message body — a preview card, a mail
+        # gateway, a proxy — then reaches a page that changes nothing.
+        # {good_url} / {reject_url} are the single-use capability links and
+        # stay available as variables, but they travel by default only in the
+        # affordances nothing prefetches: the ntfy action buttons and the
+        # Telegram inline keyboard, both built in notification_service.
+        "event_type": "print_confirm_request",
+        "name": "Print Outcome Confirmation",
+        "title_template": "How did your print come out?",
+        "body_template": "{printer}: {filename}\nConfirm: {confirm_url}",
+    },
+    {
         "event_type": "print_missing_spool_assignment",
         "name": "Missing Spool Assignment",
         "title_template": "Missing Spool Assignment",
@@ -139,9 +153,15 @@ DEFAULT_TEMPLATES = [
     },
     {
         "event_type": "ha_sensor_alert",
-        "name": "Home Assistant Sensor Alert",
+        "name": "Printer Sensor Alert",
         "title_template": "Sensor Alert",
         "body_template": "{printer}: {sensor} is {state}",
+    },
+    {
+        "event_type": "location_ha_sensor_alert",
+        "name": "Storage Location Sensor Alert",
+        "title_template": "Sensor Alert",
+        "body_template": "{location}: {sensor} is {state}",
     },
     {
         "event_type": "first_layer_complete",
@@ -215,13 +235,13 @@ DEFAULT_TEMPLATES = [
         "event_type": "stock_reorder_alert",
         "name": "Stock Reorder Alert",
         "title_template": "Reorder Alert: {material}",
-        "body_template": "{material} ({brand}) has reached the reorder point.\nStock: {stock_g}g | Rate: {rate_g_day}g/day | Days left: {days_left}d\nReorder now to avoid a stock break.",
+        "body_template": "{material} {subtype} {color} ({brand}) has reached the reorder point.\nStock: {stock_g}g | Rate: {rate_g_day}g/day | Days left: {days_left}d\nReorder now to avoid a stock break.",
     },
     {
         "event_type": "stock_break_alert",
         "name": "Stock Break Alert",
         "title_template": "Stock Break Risk: {material}",
-        "body_template": "{material} ({brand}) will run out before replenishment arrives.\nStock: {stock_g}g | Rate: {rate_g_day}g/day | Lead time: {lead_time_days}d\nOnly {days_left}d of stock remaining — order immediately.",
+        "body_template": "{material} {subtype} {color} ({brand}) will run out before replenishment arrives.\nStock: {stock_g}g | Rate: {rate_g_day}g/day | Lead time: {lead_time_days}d\nOnly {days_left}d of stock remaining — order immediately.",
     },
     # User email notification templates (sent to the print job owner).
     # Names include " Email" so they aren't confused with the provider-level

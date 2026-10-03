@@ -96,6 +96,12 @@ class AppSettings(BaseModel):
     check_updates: bool = Field(default=True, description="Automatically check for updates on startup")
     check_printer_firmware: bool = Field(default=True, description="Check for printer firmware updates from Bambu Lab")
     include_beta_updates: bool = Field(default=False, description="Include beta/prerelease versions in update checks")
+    announcements_enabled: bool = Field(
+        default=True, description="Fetch announcements from the Bambuddy maintainers (a signed file on GitHub)"
+    )
+    announcements_all_users: bool = Field(
+        default=False, description="Show announcements to every signed-in user, not only administrators"
+    )
 
     # Language
     language: str = Field(default="en", description="UI language (en, de, fr, ja, it, pt-BR)")
@@ -115,6 +121,18 @@ class AppSettings(BaseModel):
     ams_temp_fair: float = Field(
         default=35.0, description="Temperature threshold for fair (orange): <= this value, > is red"
     )
+    # Separate from ams_temp_fair on purpose (#2905). The fair threshold decides
+    # when the AMS card turns amber; this decides when a notification is sent.
+    # 35 C is a sensible place to change a colour and not a sensible place to
+    # page someone -- a room above 35 C makes the alarm fire once an hour for as
+    # long as the weather lasts, and the only way to silence it was to raise the
+    # display band and lose the colour that says the unit is warm. None means
+    # "not set", which resolves to ams_temp_fair so every existing install keeps
+    # behaving exactly as it does now.
+    ams_temp_alarm: float | None = Field(
+        default=None,
+        description="Temperature threshold (°C) for sending an alarm. Unset falls back to ams_temp_fair.",
+    )
     ams_history_retention_days: int = Field(default=30, description="Number of days to keep AMS sensor history data")
     printer_sensor_history_retention_days: int = Field(
         default=30, description="Number of days to keep printer heater history data (nozzle / bed / chamber)"
@@ -131,6 +149,16 @@ class AppSettings(BaseModel):
     ambient_drying_enabled: bool = Field(
         default=False,
         description="Automatically dry AMS filament on idle printers when humidity exceeds threshold, regardless of queue",
+    )
+    ambient_drying_sustained_minutes: int = Field(
+        default=0,
+        ge=0,
+        le=240,
+        description=(
+            "Minutes the humidity must stay above the threshold before an ambient "
+            "auto-dry starts (0 = start immediately). Rides out the reading spike "
+            "from opening the AMS lid instead of buying a dry cycle for it."
+        ),
     )
     print_drying_enabled: bool = Field(
         default=False,
@@ -385,6 +413,24 @@ class AppSettings(BaseModel):
         default="auto",
         description="Default nozzle offset calibration option for new prints (dual-nozzle printers only)",
     )
+    default_confirm_outcome: bool = Field(
+        default=False,
+        description="Default for asking for a post-print outcome verdict on new prints (#1898)",
+    )
+    confirm_outcome_external_prints: bool = Field(
+        default=False,
+        description=(
+            "Also ask for the outcome of prints Bambuddy archived but did not dispatch — started at "
+            "the printer, in Bambu Studio or in the Handy app (#1898)"
+        ),
+    )
+    confirm_default_good_on_plate_clear: bool = Field(
+        default=False,
+        description=(
+            "When the build plate is released (manual acknowledgment or next dispatch) with the "
+            "outcome prompt still unanswered, record the print as a good part (#1898)"
+        ),
+    )
 
     # Staggered batch start for multi-printer jobs
     stagger_group_size: int = Field(
@@ -606,6 +652,27 @@ class AppSettings(BaseModel):
         description="Global lead time floor (days) used in reorder point calculation for all SKUs",
     )
 
+    location_sensor_poll_interval: int = Field(
+        default=120,
+        ge=60,
+        le=3600,
+        description="Seconds between Home Assistant polls/UI refreshes for storage-location sensors",
+    )
+    # Server-backed rather than per-browser: these seed the alert rule written
+    # onto each sensor row when one is bound, so two admins binding sensors
+    # from different browsers must not seed different rules — and a restore
+    # has to bring them back. The "show on card" default stays local, because
+    # show_on_card is decided per sensor and this is only its form
+    # pre-selection. Same JSON-in-a-string shape as preheat_filament_targets.
+    location_sensor_alert_defaults: str = Field(
+        default="",
+        description=(
+            "JSON map of sensor category (temperature/humidity/battery) → "
+            '{"alertAbove": str, "alertBelow": str, "notifyOnAlert": bool}, seeding new '
+            "storage-location sensor bindings. Empty = built-in defaults."
+        ),
+    )
+
     # Default sidebar order (admin-set for all users)
     default_sidebar_order: str = Field(
         default="",
@@ -635,6 +702,8 @@ class AppSettingsUpdate(BaseModel):
     check_updates: bool | None = None
     check_printer_firmware: bool | None = None
     include_beta_updates: bool | None = None
+    announcements_enabled: bool | None = None
+    announcements_all_users: bool | None = None
     local_login_enabled: bool | None = None
     language: str | None = None
     notification_language: str | None = None
@@ -643,11 +712,13 @@ class AppSettingsUpdate(BaseModel):
     ams_humidity_fair: int | None = None
     ams_temp_good: float | None = None
     ams_temp_fair: float | None = None
+    ams_temp_alarm: float | None = None
     ams_history_retention_days: int | None = None
     printer_sensor_history_retention_days: int | None = None
     queue_drying_enabled: bool | None = None
     queue_drying_block: bool | None = None
     ambient_drying_enabled: bool | None = None
+    ambient_drying_sustained_minutes: int | None = Field(default=None, ge=0, le=240)
     print_drying_enabled: bool | None = None
     drying_presets: str | None = None
     ams_humidity_thresholds: str | None = None
@@ -703,6 +774,9 @@ class AppSettingsUpdate(BaseModel):
     default_layer_inspect: bool | None = None
     default_timelapse: bool | None = None
     default_nozzle_offset_cali: TriState | None = None
+    default_confirm_outcome: bool | None = None
+    confirm_outcome_external_prints: bool | None = None
+    confirm_default_good_on_plate_clear: bool | None = None
     stagger_group_size: int | None = Field(default=None, ge=1, le=50)
     stagger_interval_minutes: int | None = Field(default=None, ge=1, le=60)
     billing_enabled: bool | None = None
@@ -748,6 +822,12 @@ class AppSettingsUpdate(BaseModel):
     obico_enabled_printers: str | None = None
     default_sidebar_order: str | None = None
     forecast_global_lead_time_days: int | None = Field(default=None, ge=0)
+    location_sensor_poll_interval: int | None = Field(default=None, ge=60, le=3600)
+    # Three categories × three short fields is well under 300 characters of
+    # JSON, so 2000 is pure headroom — the cap only stops a stray client from
+    # parking megabytes in the settings table. Write path only: the AppSettings
+    # read model must keep accepting whatever an older install already stored.
+    location_sensor_alert_defaults: str | None = Field(default=None, max_length=2000)
 
     @field_validator(*LAN_SERVICE_URL_SETTINGS)
     @classmethod

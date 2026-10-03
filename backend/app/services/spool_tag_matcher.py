@@ -9,6 +9,10 @@ from sqlalchemy.orm import selectinload
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.schemas.spool import normalize_effect_type
+from backend.app.services import slot_unlink_grace
+from backend.app.services.color_catalog_lookup import resolve_bambu_color
+from backend.app.services.slot_nozzle import resolve_slot_nozzle
+from backend.app.services.spool_filament_preset import printer_safe_filament_id, resolve_spool_preset
 from backend.app.utils.tag_normalization import (
     normalize_tag_uid as _normalize_tag_uid,
     normalize_tray_uuid as _normalize_tray_uuid,
@@ -51,7 +55,6 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
     Extracts material, subtype, color, temps, and tag info from the tray dict.
     Looks up core_weight from the spool catalog if a Bambu Lab entry matches.
     """
-    from backend.app.models.color_catalog import ColorCatalogEntry
     from backend.app.models.spool_catalog import SpoolCatalogEntry
 
     tray_type = tray_data.get("tray_type", "")  # "PLA"
@@ -105,42 +108,17 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
     # the printer-reported material variant (`tray_sub_brands`, e.g. "PLA Matte")
     # so a new Ivory White roll doesn't get auto-named Jade White just because
     # PLA Basic happens to come first in catalog insertion order. See #1227.
+    #
+    # Clear rolls (#1545) and the catalogue's gradient stops and effect hint
+    # come back from the same call: the lookup is shared with the Spoolman path
+    # so the two modes stop answering this question differently (#2907). The
+    # stops and hint are the same row the spool form's colour picker reads, so
+    # a roll the AMS identified renders like one picked by hand from that row.
     rgba = tray_color if tray_color else None
-    color_name = None
-    extra_colors = None
-    effect_type = None
-
-    # Transparent filament (#1545): the AMS reports alpha=00 for clear spools.
-    # Skip the catalog lookup — the catalog only stores RGB so 000000 would
-    # resolve to "Black" (or whatever else lives at that RGB), which is exactly
-    # the bug the cream rewrite in parse_ams_tray used to paper over. Store
-    # "Clear" directly and let the frontend's resolveSpoolColorName +
-    # hexToColorName render the swatch as a checkerboard.
-    if rgba and len(rgba) == 8 and rgba[6:8].lower() == "00":
-        color_name = "Clear"
-    elif rgba and len(rgba) >= 6:
-        hex_prefix = f"#{rgba[:6].upper()}"
-        cat_query = (
-            select(ColorCatalogEntry)
-            .where(func.upper(ColorCatalogEntry.hex_color) == hex_prefix)
-            .where(func.upper(ColorCatalogEntry.manufacturer) == "BAMBU LAB")
-        )
-        if tray_sub_brands:
-            cat_query = cat_query.where(func.upper(ColorCatalogEntry.material) == tray_sub_brands.upper())
-        # Deterministic tiebreak when the material filter can't disambiguate
-        # (e.g. third-party spools with empty tray_sub_brands).
-        cat_query = cat_query.order_by(ColorCatalogEntry.id).limit(1)
-        cat_result = await db.execute(cat_query)
-        entry = cat_result.scalar_one_or_none()
-        if entry:
-            color_name = entry.color_name
-            # The same row the spool form's colour picker reads. It hands
-            # `extra_colors` and `effect_type` to the new spool when a user
-            # picks a colour by hand (ColorSection.selectColor), and this path
-            # was taking the name alone -- so a roll added by hand rendered
-            # its gradient and a roll the AMS identified for you did not.
-            extra_colors = entry.extra_colors
-            effect_type = entry.effect_type
+    catalog_color = await resolve_bambu_color(db, rgba, tray_sub_brands)
+    color_name = catalog_color.name if catalog_color else None
+    extra_colors = catalog_color.extra_colors if catalog_color else None
+    effect_type = catalog_color.effect_type if catalog_color else None
 
     # If tray_id_name is a human-readable name (no "-" code), fall back to it.
     if not color_name and tray_id_name and "-" not in tray_id_name:
@@ -224,6 +202,18 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
         remain_pct = 100  # Unknown → assume full
     weight_used = round(label_weight * (100 - remain_pct) / 100.0, 1)
 
+    # A new spool of an already-numbered product inherits its material number
+    # (#2870) — an RFID-scanned refill arrives costed, not blank.
+    from backend.app.services.material_number import find_material_number_for_product
+
+    material_number = await find_material_number_for_product(
+        db,
+        material=material,
+        subtype=subtype,
+        brand="Bambu Lab",
+        color_name=color_name,
+    )
+
     spool = Spool(
         material=material,
         subtype=subtype,
@@ -232,6 +222,7 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
         extra_colors=extra_colors,
         effect_type=effect_type,
         brand="Bambu Lab",
+        material_number=material_number,
         label_weight=label_weight,
         core_weight=core_weight,
         core_weight_catalog_id=core_weight_catalog_id,
@@ -253,8 +244,16 @@ async def create_spool_from_tray(db: AsyncSession, tray_data: dict) -> Spool:
     # when creating SpoolAssignment runs synchronously outside the greenlet.
     spool.k_profiles = []
     spool.assignments = []
+    spool.supplier_links = []
     db.add(spool)
     await db.flush()
+
+    # A new spool of a product that already carries supplier assignments
+    # inherits the source list (#2988) — a scanned refill arrives knowing
+    # where it can be bought.
+    from backend.app.services.supplier_links import apply_supplier_inheritance
+
+    await apply_supplier_inheritance(db, spool)
 
     logger.info(
         "Auto-created spool %d from AMS tray data: %s %s %s (tag=%s uuid=%s)",
@@ -557,6 +556,7 @@ async def auto_assign_spool(
     )
     db.add(assignment)
     await db.flush()
+    slot_unlink_grace.forget_slot(printer_id, ams_id, tray_id)
 
     # Apply K-profile via MQTT (if available)
     # NOTE: Do NOT send ams_set_filament_setting here. This function is only
@@ -566,24 +566,49 @@ async def auto_assign_spool(
     try:
         client = printer_manager.get_client(printer_id)
         if client:
-            # Apply K-profile if available
-            nozzle_diameter = "0.4"
-            if state and state.nozzles:
-                nd = state.nozzles[0].nozzle_diameter
-                if nd:
-                    nozzle_diameter = nd
+            # Which nozzle this slot feeds, resolved the same way every other
+            # slot-configuring path resolves it (services.slot_nozzle).
+            slot_nozzle = resolve_slot_nozzle(state, ams_id, tray_id, printer_manager.get_model(printer_id))
+            nozzle_diameter = slot_nozzle.diameter
 
-            matching_kp = None
+            # Prefer the profile calibrated for THIS hotend, falling back to one
+            # stored for the same nozzle size on the other. Before this the
+            # first row matching (printer, diameter) won outright with no
+            # extruder test at all -- on a dual-nozzle printer that is a coin
+            # toss between the two hotends, on the path that fires unattended
+            # every time an RFID spool is loaded.
+            exact_kp = None
+            fallback_kp = None
             for kp in spool.k_profiles:
-                if kp.printer_id == printer_id and kp.nozzle_diameter == nozzle_diameter:
-                    matching_kp = kp
+                if kp.printer_id != printer_id or kp.nozzle_diameter != nozzle_diameter:
+                    continue
+                if not slot_nozzle.flow_matches(kp.nozzle_type):
+                    continue
+                if slot_nozzle.extruder is not None and kp.extruder == slot_nozzle.extruder:
+                    exact_kp = kp
                     break
+                if fallback_kp is None:
+                    fallback_kp = kp
+            matching_kp = exact_kp or fallback_kp
+
+            # The id sent with extrusion_cali_sel has to name the preset the
+            # profile was calibrated under, and that preset can differ per
+            # printer model -- so it comes from the same cascade the assign
+            # paths use rather than straight off the spool.
+            model_filament, _ = await resolve_spool_preset(
+                db,
+                spool_id=spool.id,
+                printer_model=printer_manager.get_model(printer_id),
+                nozzle_diameter=nozzle_diameter,
+                fallback_filament=spool.slicer_filament,
+                fallback_name=spool.slicer_filament_name,
+            )
 
             if matching_kp and matching_kp.cali_idx is not None:
                 # The filament_id in extrusion_cali_sel must match the filament preset
                 # under which the K-profile was calibrated. Use spool.slicer_filament
                 # (the preset assigned in inventory), falling back to tray's RFID value.
-                cali_filament_id = spool.slicer_filament or tray_info_idx or ""
+                cali_filament_id = printer_safe_filament_id(model_filament, spool.slicer_filament, tray_info_idx)
                 client.extrusion_cali_sel(
                     ams_id=ams_id,
                     tray_id=tray_id,
@@ -610,7 +635,7 @@ async def auto_assign_spool(
                 # so the printer keeps its existing calibration selection.
                 live_cali_idx = tray.get("cali_idx")
                 if live_cali_idx is not None and live_cali_idx >= 0:
-                    cali_filament_id = spool.slicer_filament or tray_info_idx or ""
+                    cali_filament_id = printer_safe_filament_id(model_filament, spool.slicer_filament, tray_info_idx)
                     client.extrusion_cali_sel(
                         ams_id=ams_id,
                         tray_id=tray_id,

@@ -21,13 +21,14 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from backend.app.models.print_batch import PrintBatch, PrintBatchPlate
 from backend.app.models.print_log import PrintLogEntry
 from backend.app.models.print_queue import PrintQueueItem, PrintQueueVariant
+from backend.app.services.queue_position import next_queue_position
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ CLONED_SETTING_COLUMNS = (
     "timelapse",
     "use_ams",
     "nozzle_offset_cali",
+    "confirm_outcome",
     "preheat_override",
     "preheat_chamber_target_override",
     "skip_filament_check",
@@ -114,6 +116,10 @@ class PlateProgress:
     actual_cost: float | None = None
     filament_used_grams: float | None = None
     print_time_seconds: int = 0
+    # Whether any queue item for this plate still exists, in any status.
+    # Dispatch clones one to inherit the print configuration, so a plate with
+    # none cannot be queued however many runs it still owes.
+    has_source: bool = False
 
     @property
     def dispatched(self) -> int:
@@ -122,6 +128,11 @@ class PlateProgress:
     @property
     def remaining(self) -> int:
         return max(0, self.quantity_target - self.dispatched)
+
+    @property
+    def can_dispatch(self) -> bool:
+        """True when this plate owes runs *and* something can produce them."""
+        return self.remaining > 0 and self.has_source
 
     @property
     def cost_per_run(self) -> float | None:
@@ -184,6 +195,16 @@ class BatchProgress:
     @property
     def remaining(self) -> int:
         return self._sum("remaining")
+
+    @property
+    def dispatchable_remaining(self) -> int:
+        """Of the runs still owed, how many can actually be queued.
+
+        Lower than ``remaining`` when a plate's last queue item was deleted:
+        the order still owes the run, but nothing survives to clone its
+        printer target, AMS mapping and print options from.
+        """
+        return sum(p.remaining for p in self.plates if p.has_source)
 
     @property
     def actual_cost(self) -> float | None:
@@ -282,6 +303,11 @@ async def load_progress(db: AsyncSession, batch: PrintBatch) -> BatchProgress:
                 plate.quantity_target += count
         elif not progress.has_targets and status in CONSUMING_STATUSES:
             plate.quantity_target += count
+        # Any surviving row is a clone source, whatever its status — a
+        # cancelled or failed run still carries the configuration a re-queue
+        # needs. Set before the status filter below so a status this module
+        # has no counter for still marks the plate dispatchable.
+        plate.has_source = True
         if status in COUNTED_STATUSES:
             setattr(plate, status, getattr(plate, status) + count)
         else:
@@ -407,34 +433,6 @@ async def refresh_batch_status_for_item(db: AsyncSession, queue_item_id: int) ->
     await refresh_batch_status(db, batch)
 
 
-async def _next_position(db: AsyncSession, printer_id: int | None) -> int:
-    """Next free queue position in the scope a clone will land in.
-
-    Positions are per-queue, not global: one sequence per printer plus one
-    shared sequence for unassigned / model-based items, matching the scope the
-    add-to-queue route uses. Taking a global MAX here would drop every clone
-    at the end of whichever printer's queue happens to be longest and scramble
-    the order the user sees.
-    """
-    # Same advisory lock the add-to-queue route takes (#1625-followup): two
-    # concurrent inserts into an empty scope would otherwise both read
-    # MAX(position) as 0 and land on position 1. SQLite serialises writes
-    # implicitly and needs no equivalent.
-    bind = db.get_bind()
-    if bind.dialect.name == "postgresql":
-        await db.execute(
-            text("SELECT pg_advisory_xact_lock(1625, :k)"), {"k": printer_id if printer_id is not None else 0}
-        )
-
-    scope = PrintQueueItem.printer_id == printer_id if printer_id is not None else PrintQueueItem.printer_id.is_(None)
-    max_pos = (
-        await db.execute(
-            select(func.max(PrintQueueItem.position)).where(scope).where(PrintQueueItem.status == "pending")
-        )
-    ).scalar() or 0
-    return max_pos + 1
-
-
 def _clone_queue_item(source: PrintQueueItem, *, position: int, created_by_id: int | None) -> PrintQueueItem:
     """Copy *source*'s print configuration into a fresh pending item.
 
@@ -462,6 +460,18 @@ def _clone_queue_item(source: PrintQueueItem, *, position: int, created_by_id: i
     return clone
 
 
+def _plate_label(plate: PlateProgress) -> str:
+    """How a plate is named in an error the user reads.
+
+    Prefers the plate name the order stored, because that is what the Batches
+    tab shows; falls back to the plate number for orders created before names
+    were recorded.
+    """
+    if plate.plate_name:
+        return plate.plate_name
+    return f"Plate {plate.plate_id if plate.plate_id is not None else 1}"
+
+
 async def dispatch_remaining(
     db: AsyncSession,
     batch: PrintBatch,
@@ -478,9 +488,12 @@ async def dispatch_remaining(
     otherwise every plate with work outstanding is dispatched in plate order.
     ``limit`` caps the total number of items created across all plates.
 
-    Raises :class:`BatchDispatchError` when a plate owes runs but has no
-    existing item to clone — the order can describe work it has never once
-    dispatched, and there is no configuration to copy in that case.
+    Raises :class:`BatchDispatchError` when nothing at all can be produced
+    because no plate that owes runs has an item to clone — the order can
+    describe work whose every run has since been deleted, and there is no
+    configuration to copy in that case. A plate in that state is skipped
+    rather than aborting the whole order: one unrecoverable plate must not
+    block the plates that are still perfectly dispatchable.
     """
     progress = await load_progress(db, batch)
     if not progress.has_targets:
@@ -491,6 +504,7 @@ async def dispatch_remaining(
         targets = [p for p in targets if p.plate_id == plate_id]
 
     created: list[PrintQueueItem] = []
+    stranded: list[PlateProgress] = []
 
     for plate in targets:
         if limit is not None and len(created) >= limit:
@@ -508,18 +522,16 @@ async def dispatch_remaining(
         ).scalar_one_or_none()
 
         if source is None:
-            raise BatchDispatchError(
-                f"Plate {plate.plate_id if plate.plate_id is not None else 1} has no queued or finished run to "
-                "copy settings from. Queue it once from the file, then dispatch the rest from here."
-            )
+            stranded.append(plate)
+            continue
 
         wanted = plate.remaining
         if limit is not None:
             wanted = min(wanted, limit - len(created))
 
-        # One scope per source printer; clones for this plate all land in it,
-        # appended after whatever is already queued there.
-        position = await _next_position(db, source.printer_id)
+        # Clones for this plate are appended to the end of the queue (#3200),
+        # after whatever is already pending, in plate order.
+        position = await next_queue_position(db)
 
         for _ in range(wanted):
             clone = _clone_queue_item(source, position=position, created_by_id=created_by_id)
@@ -533,11 +545,20 @@ async def dispatch_remaining(
                 db.add(cloned_variant)
             created.append(clone)
 
+    if not created and stranded:
+        names = ", ".join(_plate_label(p) for p in stranded)
+        raise BatchDispatchError(
+            f"{names} {'have' if len(stranded) > 1 else 'has'} no queued or finished run to copy settings from. "
+            "Queue the plate once from the file, then dispatch the rest from here."
+        )
+
     if created:
         # Dispatching more work can only ever un-fulfil an order, but run the
         # check anyway so a reopened batch flips back from completed.
         await db.flush()
         await refresh_batch_status(db, batch)
 
+    if stranded:
+        logger.info("Batch %s: skipped %d plate(s) with no item to clone", batch.id, len(stranded))
     logger.info("Dispatched %d item(s) for batch %s", len(created), batch.id)
     return created

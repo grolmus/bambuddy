@@ -614,3 +614,245 @@ class TestFilamentRequirementMemo:
         assert await scheduler._get_filament_requirements(db, item) is None
         assert await scheduler._get_filament_requirements(db, item) is None
         assert db.execute.await_count == 1
+
+
+class TestTheHoldReasonSurvivesTheNextPass:
+    """The reason is the hold's whole explanation, so a later pass must keep it.
+
+    Since #3074 the scheduler clears the reason of every staged item on each
+    pass, because a reason left from before staging would otherwise stand
+    forever. The unmatched-filament hold writes its reason at the moment it
+    stages the item, so clearing it would leave a job that waits for a start
+    press with nothing on the row saying which spool to load.
+    """
+
+    @pytest.fixture
+    async def session_maker(self):
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        import backend.app.models  # noqa: F401 - populate Base.metadata
+        from backend.app.core.database import Base
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        try:
+            yield async_sessionmaker(engine, expire_on_commit=False)
+        finally:
+            await engine.dispose()
+
+    async def _staged_item(self, session_maker, reason):
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.models.printer import Printer
+
+        async with session_maker() as db:
+            printer = Printer(
+                name="P2S-5", serial_number="SERIAL", ip_address="10.0.0.1", access_code="code", model="P2S"
+            )
+            db.add(printer)
+            await db.flush()
+            item = PrintQueueItem(
+                printer_id=printer.id, status="pending", position=0, manual_start=True, waiting_reason=reason
+            )
+            db.add(item)
+            await db.commit()
+            return item.id
+
+    async def _reason_after_a_pass(self, session_maker, item_id):
+        from backend.app.models.print_queue import PrintQueueItem
+
+        scheduler = PrintScheduler()
+        with (
+            patch("backend.app.services.print_scheduler.async_session", session_maker),
+            patch("backend.app.services.print_scheduler.printer_manager.is_connected", MagicMock(return_value=True)),
+            patch("backend.app.services.print_scheduler.printer_manager.get_status", MagicMock(return_value=None)),
+            patch.object(scheduler, "_is_printer_idle", MagicMock(return_value=True)),
+            patch.object(scheduler, "_check_auto_drying", AsyncMock()),
+        ):
+            await scheduler.check_queue()
+        async with session_maker() as db:
+            return (await db.get(PrintQueueItem, item_id)).waiting_reason
+
+    @pytest.mark.asyncio
+    async def test_the_hold_reason_stays_on_a_staged_item(self, session_maker):
+        item_id = await self._staged_item(session_maker, "Needs PETG #2850E0")
+
+        assert await self._reason_after_a_pass(session_maker, item_id) == "Needs PETG #2850E0"
+
+    @pytest.mark.asyncio
+    async def test_any_other_reason_on_a_staged_item_is_still_cleared(self, session_maker):
+        """#3074's rule for everything else is unchanged."""
+        item_id = await self._staged_item(session_maker, "Busy: P2S-5")
+
+        assert await self._reason_after_a_pass(session_maker, item_id) is None
+
+
+def _matching_scheduler(trays):
+    """A scheduler whose real matcher runs against ``trays``."""
+    scheduler = _scheduler(trays)
+    scheduler._get_bool_setting = AsyncMock(return_value=False)
+    scheduler._get_job_name = AsyncMock(return_value="body1")
+    scheduler._get_printer = AsyncMock(return_value=MagicMock(model="P2S"))
+    return scheduler
+
+
+class TestUnresolvedSlotsAreMatchedAgain:
+    """A fitting mapping keeps its resolved slots and has only its gaps matched again.
+
+    The hold keeps a pinned item's mapping, and an unresolved slot is not a
+    conflict, so without this nothing would look at the gap again: loading the
+    missing spool and pressing Start would hold the job again, every time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_spool_loaded_after_the_hold_is_found(self):
+        # Held with slot 3 unresolved; dark-blue PETG has since gone into tray 2.
+        scheduler = _matching_scheduler(P2S_5_TRAYS)
+        item = _item(ams_mapping=json.dumps([0, -1, -1]))
+        db = AsyncMock()
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            await scheduler._ensure_ams_mapping(db, 8, item)
+            blocked = await scheduler._block_on_unmatched_filament(db, item)
+
+        assert json.loads(item.ams_mapping) == [0, -1, 2]
+        assert blocked is False
+
+    @pytest.mark.asyncio
+    async def test_a_tray_the_user_picked_is_kept_and_not_handed_out_twice(self):
+        """The user put slot 1 on tray 2 by hand. Slot 3's best match is that same
+        tray, but it is taken, so slot 3 gets the other PETG instead of sharing."""
+        scheduler = _matching_scheduler(P2S_5_TRAYS)
+        item = _item(ams_mapping=json.dumps([2, -1, -1]))
+        db = AsyncMock()
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            await scheduler._ensure_ams_mapping(db, 8, item)
+
+        assert json.loads(item.ams_mapping) == [2, -1, 0]
+
+    @pytest.mark.asyncio
+    async def test_still_missing_leaves_the_mapping_and_holds(self):
+        trays = [
+            {"global_tray_id": 0, "type": "PETG", "color": "76D9F4FF"},
+            {"global_tray_id": 1, "type": "ASA", "color": "161616FF"},
+        ]
+        scheduler = _matching_scheduler(trays)
+        item = _item(ams_mapping=json.dumps([0, -1, -1]))
+        db = AsyncMock()
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            await scheduler._ensure_ams_mapping(db, 8, item)
+            blocked = await scheduler._block_on_unmatched_filament(db, item)
+
+        assert json.loads(item.ams_mapping) == [0, -1, -1]
+        assert blocked is True
+
+    @pytest.mark.asyncio
+    async def test_print_anyway_leaves_the_gap_alone(self):
+        scheduler = _matching_scheduler(P2S_5_TRAYS)
+        item = _item(ams_mapping=json.dumps([0, -1, -1]), skip_filament_check=True)
+        db = AsyncMock()
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            await scheduler._ensure_ams_mapping(db, 8, item)
+
+        assert json.loads(item.ams_mapping) == [0, -1, -1]
+
+    @pytest.mark.asyncio
+    async def test_a_complete_mapping_is_not_matched_again(self):
+        scheduler = _matching_scheduler(P2S_5_TRAYS)
+        scheduler._compute_ams_mapping_for_printer = AsyncMock(return_value=[0, -1, 2])
+        item = _item(ams_mapping=json.dumps([0, -1, 2]))
+        db = AsyncMock()
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            await scheduler._ensure_ams_mapping(db, 8, item)
+
+        scheduler._compute_ams_mapping_for_printer.assert_not_awaited()
+
+
+class TestMissingFilamentForStart:
+    """The Start button's question: would this item be held again right now?"""
+
+    @pytest.mark.asyncio
+    async def test_names_a_filament_that_is_still_not_loaded(self):
+        trays = [
+            {"global_tray_id": 0, "type": "PETG", "color": "76D9F4FF"},
+            {"global_tray_id": 1, "type": "ASA", "color": "161616FF"},
+        ]
+        scheduler = _matching_scheduler(trays)
+        item = _item(ams_mapping=json.dumps([0, -1, -1]))
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            missing = await scheduler.missing_filament_for_start(AsyncMock(), item)
+
+        assert missing is not None and len(missing) == 1
+        assert "PETG" in missing[0] and "#2850E0" in missing[0]
+        # Asking is not acting: the stored mapping is the scheduler's to change.
+        assert json.loads(item.ams_mapping) == [0, -1, -1]
+
+    @pytest.mark.asyncio
+    async def test_nothing_missing_once_the_spool_is_loaded(self):
+        scheduler = _matching_scheduler(P2S_5_TRAYS)
+        item = _item(ams_mapping=json.dumps([0, -1, -1]))
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            assert await scheduler.missing_filament_for_start(AsyncMock(), item) is None
+
+    @pytest.mark.asyncio
+    async def test_a_mapping_from_another_printer_is_judged_by_a_fresh_match(self):
+        """The #2799 mapping on P2S-5 conflicts, so Start judges a fresh match,
+        which finds both filaments."""
+        scheduler = _matching_scheduler(P2S_5_TRAYS)
+        item = _item()
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            assert await scheduler.missing_filament_for_start(AsyncMock(), item) is None
+
+    @pytest.mark.asyncio
+    async def test_no_mapping_and_nothing_matching_is_missing(self):
+        trays = [{"global_tray_id": 0, "type": "ASA", "color": "161616FF"}]
+        scheduler = _matching_scheduler(trays)
+        item = _item(ams_mapping=None)
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            missing = await scheduler.missing_filament_for_start(AsyncMock(), item)
+
+        assert missing is not None and len(missing) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"skip_filament_check": True},
+            # A model-based item picks its printer at dispatch.
+            {"printer_id": None},
+        ],
+    )
+    async def test_does_not_judge_what_dispatch_would_not(self, overrides):
+        trays = [{"global_tray_id": 0, "type": "ASA", "color": "161616FF"}]
+        scheduler = _matching_scheduler(trays)
+        item = _item(ams_mapping=None, **overrides)
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = MagicMock()
+            assert await scheduler.missing_filament_for_start(AsyncMock(), item) is None
+
+    @pytest.mark.asyncio
+    async def test_no_status_is_not_a_finding(self):
+        scheduler = _matching_scheduler(P2S_5_TRAYS)
+        item = _item(ams_mapping=None)
+
+        with patch("backend.app.services.print_scheduler.printer_manager") as pm:
+            pm.get_status.return_value = None
+            assert await scheduler.missing_filament_for_start(AsyncMock(), item) is None

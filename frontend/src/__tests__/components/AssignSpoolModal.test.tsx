@@ -109,6 +109,38 @@ describe('AssignSpoolModal', () => {
     expect(screen.getByText(/Jade White/)).toBeInTheDocument();
   });
 
+  it('shows each spool ID on the assignment card (#2978)', async () => {
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('#1')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('#2')).toBeInTheDocument();
+    expect(screen.getByText('#3')).toBeInTheDocument();
+  });
+
+  it('renders a clear tray as the transparency checkerboard, not an invisible circle (#2912)', async () => {
+    render(
+      <AssignSpoolModal
+        {...defaultProps}
+        trayInfo={{ type: 'PETG', color: '00000000', location: 'AMS 1 - Slot 1' }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/PETG/)).toBeInTheDocument();
+    });
+
+    // The tray swatch used to be painted `#00000000` directly, which is a valid
+    // colour the browser renders as nothing at all — a clear spool showed an
+    // empty circle. getSwatchStyle draws the checkerboard instead.
+    const swatches = Array.from(document.querySelectorAll<HTMLElement>('[style]'));
+    expect(
+      swatches.some((el) => el.style.backgroundImage.includes('repeating-conic-gradient')),
+    ).toBe(true);
+  });
+
   it('filters out spools already assigned to other slots', async () => {
     (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
       { id: 1, spool_id: 3, printer_id: 1, ams_id: 0, tray_id: 1 }, // spool 3 assigned to different slot
@@ -446,6 +478,7 @@ describe('AssignSpoolModal — Spoolman enabled (T-Gap 7)', () => {
       expect(screen.getByText(/Bambu Lab/)).toBeInTheDocument();
     });
     expect(api.getSpoolmanInventorySpools).toHaveBeenCalledWith(false);
+    expect(screen.getByText('#200')).toBeInTheDocument();
   });
 
   it('does not fetch Spoolman spools when spoolmanEnabled=false', async () => {

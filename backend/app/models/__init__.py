@@ -1,9 +1,11 @@
 from backend.app.models.ams_history import AMSSensorHistory
 from backend.app.models.ams_label import AmsLabel
+from backend.app.models.announcement import Announcement, AnnouncementRead
 from backend.app.models.api_key import APIKey
 from backend.app.models.archive import PrintArchive
 from backend.app.models.auth_ephemeral import AuthEphemeralToken, AuthRateLimitEvent
 from backend.app.models.color_catalog import ColorCatalogEntry
+from backend.app.models.connected_app import ConnectedApp, ConnectedAppGrant
 from backend.app.models.filament import Filament
 from backend.app.models.github_backup import GitHubBackupConfig, GitHubBackupLog
 from backend.app.models.group import Group, user_groups
@@ -11,6 +13,7 @@ from backend.app.models.kprofile_note import KProfileNote
 from backend.app.models.library import FileVariantGroup, LibraryFile, LibraryFolder
 from backend.app.models.local_preset import LocalPreset
 from backend.app.models.location import Location
+from backend.app.models.location_ha_sensor import LocationHASensor
 from backend.app.models.long_lived_token import LongLivedToken
 from backend.app.models.maintenance import MaintenanceHistory, MaintenanceType, PrinterMaintenance
 from backend.app.models.notification import NotificationLog
@@ -33,9 +36,11 @@ from backend.app.models.sponsor_toast_state import SponsorToastState
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_catalog import SpoolCatalogEntry
+from backend.app.models.spool_filament_preset import SpoolFilamentPreset, SpoolmanFilamentPreset
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.models.spoolbuddy_device import SpoolBuddyDevice
+from backend.app.models.supplier import SpoolmanSpoolSupplier, SpoolSupplier, Supplier
 from backend.app.models.user import User
 from backend.app.models.user_email_pref import UserEmailPreference
 from backend.app.models.user_otp_code import UserOTPCode
@@ -81,17 +86,26 @@ __all__ = [
     "PipelineRun",
     "SlicerPipeline",
     "Spool",
+    "SpoolFilamentPreset",
     "SpoolKProfile",
+    "SpoolmanFilamentPreset",
     "SpoolAssignment",
     "SpoolCatalogEntry",
     "SpoolUsageHistory",
+    "Supplier",
+    "SpoolSupplier",
+    "SpoolmanSpoolSupplier",
     "ColorCatalogEntry",
     "SpoolBuddyDevice",
     "SponsorToastState",
+    "Announcement",
+    "AnnouncementRead",
     "UserEmailPreference",
     "UserOTPCode",
     "UserTOTP",
     "AuthEphemeralToken",
     "AuthRateLimitEvent",
     "LongLivedToken",
+    "ConnectedApp",
+    "ConnectedAppGrant",
 ]

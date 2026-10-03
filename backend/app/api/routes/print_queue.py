@@ -9,6 +9,7 @@ from pathlib import Path
 import defusedxml.ElementTree as ET
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, func, inspect, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -50,8 +51,10 @@ from backend.app.services.print_batch import (
     dispatch_remaining,
     load_progress,
     refresh_batch_status,
+    refresh_batch_status_for_item,
 )
 from backend.app.services.print_cost_estimate import estimate_queue_source_cost
+from backend.app.services.queue_position import lock_queue_positions, max_queue_position
 from backend.app.utils.printer_models import (
     is_gcode_compatible,
 )
@@ -199,6 +202,65 @@ def _assert_can_queue_library_file(library_file: LibraryFile, current_user: User
         and library_file.created_by_id != current_user.id
     ):
         raise HTTPException(404, "Library file not found")
+
+
+async def _is_orders_last_source(db: AsyncSession, item: PrintQueueItem) -> bool:
+    """True when deleting *item* would leave an order owing runs it can't queue.
+
+    Dispatch produces the runs an order still owes by cloning an existing
+    queue item for the same plate — that row is the only record of the printer
+    target, AMS mapping and print options the user chose. Delete the last one
+    while the plate still has a target and the order is stranded: it goes on
+    reporting work outstanding with no way left to produce it (#2960).
+    """
+    if item.batch_id is None:
+        return False
+
+    # A cancelled order can never dispatch again, so nothing about it can be
+    # stranded and its leftover rows must stay deletable — tidying up after a
+    # cancel is the most likely reason anyone deletes them.
+    status = (await db.execute(select(PrintBatch.status).where(PrintBatch.id == item.batch_id))).scalar_one_or_none()
+    if status == "cancelled":
+        return False
+
+    plate_scope = (
+        PrintBatchPlate.plate_id == item.plate_id if item.plate_id is not None else PrintBatchPlate.plate_id.is_(None)
+    )
+    # first(), not scalar_one_or_none(): a UNIQUE(batch_id, plate_id) does not
+    # constrain NULL plate_ids on either dialect, and a duplicate whole-file
+    # row must not turn a delete into a 500.
+    target = (
+        (
+            await db.execute(
+                select(PrintBatchPlate.quantity_target)
+                .where(PrintBatchPlate.batch_id == item.batch_id)
+                .where(plate_scope)
+                .order_by(PrintBatchPlate.quantity_target.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    # No target row: a grouping, or a plate assigned into the order by hand.
+    # A target of 0 is legal and means the plate is not wanted. Neither owes
+    # anything, so neither can be stranded.
+    if not target:
+        return False
+
+    item_scope = (
+        PrintQueueItem.plate_id == item.plate_id if item.plate_id is not None else PrintQueueItem.plate_id.is_(None)
+    )
+    survivor = (
+        await db.execute(
+            select(PrintQueueItem.id)
+            .where(PrintQueueItem.batch_id == item.batch_id)
+            .where(item_scope)
+            .where(PrintQueueItem.id != item.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return survivor is None
 
 
 async def _assert_can_dispatch_batch_sources(db: AsyncSession, batch_id: int, current_user: User | None) -> None:
@@ -411,6 +473,7 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
         "timelapse": item.timelapse,
         "use_ams": item.use_ams,
         "nozzle_offset_cali": item.nozzle_offset_cali,
+        "confirm_outcome": item.confirm_outcome,
         "preheat_override": item.preheat_override,
         "preheat_chamber_target_override": item.preheat_chamber_target_override,
         "status": item.status,
@@ -553,7 +616,12 @@ async def list_queue(
             # Cross-model candidates (#671) and their files, for the card label.
             selectinload(PrintQueueItem.variants).selectinload(PrintQueueVariant.library_file),
         )
-        .order_by(PrintQueueItem.printer_id.nulls_first(), PrintQueueItem.position)
+        # The order the scheduler dispatches in (#3200), so the first pending
+        # item for a printer is the one it will start next -- which is what the
+        # printer card's "Next in queue" shows. Sorting by printer first put
+        # every "Any <model>" job (no printer_id) ahead of a job pinned to that
+        # printer, whatever their positions.
+        .order_by(PrintQueueItem.position, PrintQueueItem.id)
     )
     if user is not None and not can_read_all:
         query = query.where(PrintQueueItem.created_by_id == user.id)
@@ -846,29 +914,34 @@ async def add_to_queue(
     # Extract filament types for model-based assignment (used by scheduler for validation)
     required_filament_types = None
     file_path = None
+    # Get file path from archive or library file
+    if archive:
+        file_path = settings.base_dir / archive.file_path
+    elif library_file:
+        lib_path = Path(library_file.file_path)
+        file_path = lib_path if lib_path.is_absolute() else settings.base_dir / library_file.file_path
     if target_model_norm:
-        # Get file path from archive or library file
-        if archive:
-            file_path = settings.base_dir / archive.file_path
-        elif library_file:
-            lib_path = Path(library_file.file_path)
-            file_path = lib_path if lib_path.is_absolute() else settings.base_dir / library_file.file_path
-
         if file_path and file_path.exists():
             filament_types = _extract_filament_types_from_3mf(file_path, data.plate_id)
             if filament_types:
                 required_filament_types = json.dumps(filament_types)
                 logger.info("Extracted filament types for model-based queue: %s", filament_types)
 
-    # If filament overrides are provided, update required_filament_types to match override types
+    # If filament overrides are provided, update required_filament_types to match override types.
+    # A specific-printer job keeps its overrides too (#3133): an override chosen for
+    # "Any P2S" survives the switch to one P2S in the print dialog, and when the
+    # dialog could not resolve every tray the scheduler recomputes the mapping at
+    # dispatch — against the 3MF's filament, unless the row still says otherwise.
+    # The type list below stays model-only; it gates which printer of a model is
+    # eligible, which a printer-targeted job has already settled.
     filament_overrides_json = None
-    if data.filament_overrides and target_model_norm:
+    if data.filament_overrides and (target_model_norm or data.printer_id is not None):
         plate_overrides = overrides_for_plate(data.filament_overrides, file_path, data.plate_id)
         if plate_overrides:
             filament_overrides_json = json.dumps(plate_overrides)
             # Update required_filament_types from overrides so scheduler validates against overridden types
             override_types = sorted({o["type"] for o in plate_overrides if "type" in o})
-            if override_types:
+            if override_types and target_model_norm:
                 # Merge with existing types (overrides may only cover some slots)
                 existing_types = set(json.loads(required_filament_types)) if required_filament_types else set()
                 # Replace types for overridden slots, keep others
@@ -911,6 +984,15 @@ async def add_to_queue(
                 batch_name_base = library_file.file_metadata.get("print_name") or library_file.filename
             else:
                 batch_name_base = library_file.filename
+        elif variant_specs:
+            # A cross-model job carries neither archive_id nor library_file_id --
+            # the candidates are the files (#671) -- so both branches above miss
+            # and every such batch was named "Batch". Unreachable until the print
+            # dialog could ask for more than one copy of one (#3101). Name it
+            # after the first candidate, which is what the dialog names the job
+            # after and what the resolver prefers when both printers are free.
+            first_file = variant_specs[0][1]
+            batch_name_base = (first_file.file_metadata or {}).get("print_name") or first_file.filename or "Batch"
         batch_name_base = batch_name_base.replace(".gcode.3mf", "").replace(".3mf", "")
 
         batch = PrintBatch(
@@ -925,47 +1007,14 @@ async def add_to_queue(
         await db.flush()  # Get batch.id before creating items
         batch_id = batch.id
 
-    # Get queue scope for this printer (or for unassigned/model-based items).
-    if data.printer_id is not None:
-        queue_scope = (
-            PrintQueueItem.printer_id == data.printer_id,
-            PrintQueueItem.status == "pending",
-        )
-    else:
-        # For unassigned/model-based items, scope across all unassigned.
-        queue_scope = (
-            PrintQueueItem.printer_id.is_(None),
-            PrintQueueItem.status == "pending",
-        )
-
-    # Serialize concurrent queue inserts to the same scope (#1625-followup).
-    # The race: two concurrent ASAP inserts both compute MAX(position) before
-    # either commits; in an empty scope, both INSERT at position 1 (duplicate).
-    # In a non-empty scope, Postgres's row-level locks on the UPDATE shift
-    # serialize naturally, but the empty-scope path has no rows to lock.
-    # A transaction-scoped advisory lock keyed on the printer_id closes that
-    # window; the lock is released automatically at commit/rollback. Different
-    # printers don't contend. SQLite serializes writes implicitly so this is a
-    # no-op there.
-    #
-    # Dialect is checked against the actual session binding, NOT the
-    # `is_sqlite()` helper, because the test fixture overrides `get_db` with a
-    # SQLite engine while `settings.database_url` still points at Postgres
-    # (the helper reads settings). Inspecting the connection directly is the
-    # right shape for any code that mutates SQL based on the live dialect.
-    from sqlalchemy import text
-
-    bind = db.get_bind()
-    if bind.dialect.name == "postgresql":
-        scope_key = data.printer_id if data.printer_id is not None else 0
-        # 1625 namespaces the lock so it can't collide with other advisory
-        # locks elsewhere in the codebase.
-        await db.execute(text("SELECT pg_advisory_xact_lock(1625, :k)"), {"k": scope_key})
+    # Positions are one sequence across every pending item (#3200), so a new
+    # item lands relative to the whole list, not to its printer's share of it.
+    queue_scope = (PrintQueueItem.status == "pending",)
+    await lock_queue_positions(db)
 
     insert_position = max(1, data.insert_position or 1)
     if data.insert_at_top or data.insert_position is not None:
-        result = await db.execute(select(func.max(PrintQueueItem.position)).where(*queue_scope))
-        max_pos = result.scalar() or 0
+        max_pos = await max_queue_position(db)
         insert_position = min(insert_position, max_pos + 1)
         await db.execute(
             update(PrintQueueItem)
@@ -975,9 +1024,7 @@ async def add_to_queue(
         )
         start_position = insert_position
     else:
-        result = await db.execute(select(func.max(PrintQueueItem.position)).where(*queue_scope))
-        max_pos = result.scalar() or 0
-        start_position = max_pos + 1
+        start_position = await max_queue_position(db) + 1
 
     # Resolve print_time_seconds for SJF scheduling (cache on item at creation)
     cached_print_time = None
@@ -1118,6 +1165,7 @@ async def add_to_queue(
             timelapse=data.timelapse,
             use_ams=data.use_ams,
             nozzle_offset_cali=data.nozzle_offset_cali,
+            confirm_outcome=data.confirm_outcome,
             preheat_override=data.preheat_override,
             preheat_chamber_target_override=data.preheat_chamber_target_override,
             gcode_injection=data.gcode_injection,
@@ -1350,6 +1398,12 @@ async def _load_batch_for_write(
     return batch
 
 
+# Deliberately without the existing batch's id: the caller may not be allowed
+# to read it. They can look it up by the pair, which applies the usual
+# ownership rules.
+_EXTERNAL_REF_TAKEN = "A batch for this external_source and external_ref already exists"
+
+
 @router.post("/batches", response_model=PrintBatchResponse)
 async def create_batch(
     data: PrintBatchCreate,
@@ -1375,6 +1429,15 @@ async def create_batch(
 
     plate_targets = _validate_plate_targets(data.plates)
     await _validate_batch_project(db, data.project_id, current_user)
+    if data.external_source is not None:
+        existing = await db.execute(
+            select(PrintBatch.id).where(
+                PrintBatch.external_source == data.external_source,
+                PrintBatch.external_ref == data.external_ref,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise HTTPException(409, _EXTERNAL_REF_TAKEN)
 
     batch = PrintBatch(
         name=data.name.strip()[:255],
@@ -1386,9 +1449,17 @@ async def create_batch(
         project_id=data.project_id,
         due_date=data.due_date,
         notes=data.notes,
+        external_source=data.external_source,
+        external_ref=data.external_ref,
     )
     db.add(batch)
-    await db.flush()  # Need batch.id before assigning to items
+    try:
+        await db.flush()  # Need batch.id before assigning to items
+    except IntegrityError:
+        # Lost a race with a concurrent create for the same external record:
+        # the unique index caught what the lookup above could not.
+        await db.rollback()
+        raise HTTPException(409, _EXTERNAL_REF_TAKEN) from None
 
     if plate_targets is not None:
         for target in plate_targets:
@@ -1589,6 +1660,8 @@ async def ungroup_batch(
 @router.get("/batches", response_model=list[PrintBatchResponse])
 async def list_batches(
     status: str | None = Query(None, description="Filter by status (active, completed, cancelled)"),
+    external_source: str | None = Query(None, description="Filter by the integration that created the batch"),
+    external_ref: str | None = Query(None, description="Filter by the external record the batch fulfils"),
     db: AsyncSession = Depends(get_db),
     auth_result: tuple[User | None, bool] = Depends(
         require_ownership_permission(
@@ -1616,6 +1689,10 @@ async def list_batches(
     )
     if status:
         query = query.where(PrintBatch.status == status)
+    if external_source is not None:
+        query = query.where(PrintBatch.external_source == external_source)
+    if external_ref is not None:
+        query = query.where(PrintBatch.external_ref == external_ref)
     if current_user is not None and not can_read_all:
         query = query.where(PrintBatch.created_by_id == current_user.id)
     result = await db.execute(query)
@@ -1734,6 +1811,8 @@ async def _build_batch_response(
         project_id=batch.project_id,
         due_date=batch.due_date,
         notes=batch.notes,
+        external_source=batch.external_source,
+        external_ref=batch.external_ref,
         pending_count=progress.pending,
         printing_count=progress.printing,
         completed_count=progress.completed,
@@ -1743,6 +1822,7 @@ async def _build_batch_response(
         has_targets=progress.has_targets,
         target_count=progress.target,
         remaining_count=progress.remaining,
+        dispatchable_count=progress.dispatchable_remaining,
         actual_cost=progress.actual_cost,
         estimated_remaining_cost=progress.estimated_remaining_cost,
         filament_used_grams=progress.filament_used_grams,
@@ -1764,6 +1844,7 @@ async def _build_batch_response(
                 estimated_remaining_cost=plate.estimated_remaining_cost,
                 filament_used_grams=plate.filament_used_grams,
                 print_time_seconds=plate.print_time_seconds,
+                can_dispatch=plate.can_dispatch,
             )
             for plate in progress.plates
         ],
@@ -1992,7 +2073,15 @@ async def delete_queue_item(
         )
     ),
 ):
-    """Remove an item from the queue."""
+    """Remove an item from the queue.
+
+    An order's last surviving run for a plate is cancelled instead of deleted
+    (#2960). The row is what a later dispatch clones, so removing it would
+    leave the order reporting work outstanding that nothing could ever
+    produce. A completed run is exempt: it is the record of something that was
+    actually made, and rewriting it as cancelled would falsify the order's
+    progress.
+    """
     user, can_modify_all = auth_result
 
     result = await db.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))
@@ -2008,13 +2097,22 @@ async def delete_queue_item(
     if item.status == "printing":
         raise HTTPException(400, "Cannot delete item that is currently printing")
 
+    keep_as_cancelled = item.status != "completed" and await _is_orders_last_source(db, item)
+
     await release_budget_reservation(
         db,
         source_type="print_queue",
         source_id=item.id,
         status="released",
     )
-    await db.delete(item)
+    if keep_as_cancelled:
+        item.status = "cancelled"
+        await db.flush()
+        # The order may have been sitting on "completed" if this run's target
+        # was met by it; cancelling reopens it.
+        await refresh_batch_status_for_item(db, item.id)
+    else:
+        await db.delete(item)
     await db.commit()
 
     # Stop an in-flight preheat for this item: the dispatch coroutine is
@@ -2023,8 +2121,15 @@ async def delete_queue_item(
 
     _scheduler.notify_dispatch_cancelled(item_id)
 
+    if keep_as_cancelled:
+        logger.info("Kept queue item %s as cancelled — last source for its batch order plate", item_id)
+        return {
+            "message": "Item cancelled rather than deleted: it is the only run the order can re-queue this plate from",
+            "deleted": False,
+        }
+
     logger.info("Deleted queue item %s", item_id)
-    return {"message": "Queue item deleted"}
+    return {"message": "Queue item deleted", "deleted": True}
 
 
 @router.post("/reorder")
@@ -2278,7 +2383,9 @@ async def start_queue_item(
     deficit (#1496) is checked first — if the assigned spool can't satisfy
     a slot's required grams, the route returns ``409`` with the deficit
     payload so the caller can show a confirm dialog and retry with
-    ``skip_filament_check=true``.
+    ``skip_filament_check=true``. The same goes for a filament the printer has
+    no tray for at all (#2799): ``409`` with ``code=unmatched_filament`` and
+    the missing filaments.
     """
     user, can_modify_all = auth_result
 
@@ -2335,6 +2442,28 @@ async def start_queue_item(
                 detail={
                     "code": "insufficient_filament",
                     "deficit": [d.to_dict() for d in deficit],
+                },
+            )
+
+        # A filament the printer has no tray for at all (#2799). Without this,
+        # Start on an item the scheduler held for exactly that would release it
+        # only for the next pass to hold it again, and nothing would ever offer
+        # "Print Anyway".
+        from backend.app.services.print_scheduler import scheduler as _scheduler
+
+        # A convenience, not a gate: the scheduler holds the item again if the
+        # filament is still missing, so a failure here must not break Start.
+        try:
+            missing = await _scheduler.missing_filament_for_start(db, item)
+        except Exception:
+            logger.exception("Queue item %s: filament check before start failed", item_id)
+            missing = None
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "unmatched_filament",
+                    "missing": missing,
                 },
             )
 

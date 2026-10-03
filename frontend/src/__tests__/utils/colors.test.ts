@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   disambiguateColorNames,
+  getSwatchStyle,
   colorFamily,
   colorSortKey,
   hexToColorName,
@@ -178,6 +179,31 @@ describe('resolveSpoolColorName', () => {
   it('returns Clear for transparent rgba even when color_name is a code', () => {
     expect(resolveSpoolColorName('A99-Z9', '00000000')).toBe('Clear');
   });
+
+  // #3090 — Spoolman has no colour-name field, so every Spoolman-backed spool
+  // arrives with its subtype sitting in color_name. It reads like a name and
+  // is not one.
+  describe('a name the backend synthesised from the subtype', () => {
+    it('loses to the catalog', () => {
+      expect(resolveSpoolColorName('Silk+', '5F6367FF', true)).toBe('Titan Gray');
+    });
+
+    it('still wins over nothing when the hex is unknown', () => {
+      // Better than "-": it at least says what is on the spool. The catalog
+      // only covers what someone put in it.
+      expect(resolveSpoolColorName('Silk+', '123456FF', true)).toBe('Silk+');
+    });
+
+    it('is not consulted when the flag is absent', () => {
+      // The flag defaults to false, so every existing caller keeps the old
+      // behaviour: a stored name is the user's and is used as given.
+      expect(resolveSpoolColorName('Silk+', '5F6367FF')).toBe('Silk+');
+    });
+
+    it('does not resurrect a Bambu internal code', () => {
+      expect(resolveSpoolColorName('A99-Z9', '123456FF', true)).toBeNull();
+    });
+  });
 });
 
 describe('colorSortKey (#2729)', () => {
@@ -341,5 +367,50 @@ describe('disambiguateColorNames', () => {
 
   it('returns empty labels when there is nothing to name', () => {
     expect(disambiguateColorNames({}, {})).toEqual(['', '']);
+  });
+});
+
+
+describe('getSwatchStyle (#1545, #2912)', () => {
+  const CHECKERBOARD = 'repeating-conic-gradient(#979797 0% 25%, #f5f5f5 0% 50%)';
+
+  it('falls back to neutral grey for missing or unparseable input', () => {
+    expect(getSwatchStyle(null)).toEqual({ backgroundColor: '#808080' });
+    expect(getSwatchStyle(undefined)).toEqual({ backgroundColor: '#808080' });
+    expect(getSwatchStyle('')).toEqual({ backgroundColor: '#808080' });
+    expect(getSwatchStyle('ABC')).toEqual({ backgroundColor: '#808080' });
+  });
+
+  it('paints an opaque colour flat, with or without the FF byte', () => {
+    expect(getSwatchStyle('FF0000')).toEqual({ backgroundColor: '#FF0000' });
+    expect(getSwatchStyle('FF0000FF')).toEqual({ backgroundColor: '#FF0000' });
+    expect(getSwatchStyle('#FF0000FF')).toEqual({ backgroundColor: '#FF0000' });
+  });
+
+  it('shows the checkerboard alone for a fully transparent colour', () => {
+    expect(getSwatchStyle('00000000')).toEqual({
+      backgroundImage: CHECKERBOARD,
+      backgroundSize: '8px 8px',
+    });
+  });
+
+  it('layers a partly translucent colour over the checkerboard (#2912)', () => {
+    // Regression: this used to fall through to the RGB prefix, so a 50%-alpha
+    // spool rendered identically to an opaque one. Spoolman mode can now store
+    // any non-FF alpha, so the in-between case is reachable in normal use.
+    const style = getSwatchStyle('FF000080');
+    expect(style.backgroundColor).toBeUndefined();
+    expect(style.backgroundImage).toBe(
+      `linear-gradient(#FF000080, #FF000080), ${CHECKERBOARD}`,
+    );
+    expect(style.backgroundSize).toBe('100% 100%, 8px 8px');
+  });
+
+  it('treats the alpha byte case-insensitively', () => {
+    expect(getSwatchStyle('ff0000ff')).toEqual({ backgroundColor: '#ff0000' });
+    expect(getSwatchStyle('ff000000')).toEqual({
+      backgroundImage: CHECKERBOARD,
+      backgroundSize: '8px 8px',
+    });
   });
 });

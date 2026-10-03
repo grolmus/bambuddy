@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Package, Layers, PlayCircle, XCircle, AlertTriangle, Clock, Coins } from 'lucide-react';
 import { api } from '../api/client';
@@ -15,6 +15,8 @@ type StatusFilter = 'active' | 'completed' | 'cancelled' | 'all';
 interface BatchOrdersViewProps {
   hasPermission: (p: Permission) => boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
+  /** A batch to scroll to and highlight (``/queue?batch=<id>``, e.g. from Bambuddy Orders). */
+  focusBatchId?: number | null;
 }
 
 /**
@@ -26,10 +28,11 @@ interface BatchOrdersViewProps {
  * against what has actually been produced — including the runs that failed and
  * are therefore still owed.
  */
-export function BatchOrdersView({ hasPermission, t }: BatchOrdersViewProps) {
+export function BatchOrdersView({ hasPermission, t, focusBatchId = null }: BatchOrdersViewProps) {
   const queryClient = useQueryClient();
   const { showToast } = useToast();
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('active');
+  // A linked batch may be finished or cancelled: show every status so it's there.
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(focusBatchId ? 'all' : 'active');
   const [cancelTarget, setCancelTarget] = useState<PrintBatch | null>(null);
 
   const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
@@ -39,6 +42,11 @@ export function BatchOrdersView({ hasPermission, t }: BatchOrdersViewProps) {
     queryKey: ['batches', statusFilter],
     queryFn: () => api.getBatches(statusFilter === 'all' ? undefined : statusFilter),
   });
+
+  const focusFound = focusBatchId != null && !!batches?.some((b) => b.id === focusBatchId);
+  useEffect(() => {
+    if (focusFound) document.getElementById(`batch-${focusBatchId}`)?.scrollIntoView({ block: 'center' });
+  }, [focusFound, focusBatchId]);
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['batches'] });
@@ -111,6 +119,7 @@ export function BatchOrdersView({ hasPermission, t }: BatchOrdersViewProps) {
               canDispatch={canDispatch}
               canCancel={canCancel}
               isDispatching={dispatchMutation.isPending && dispatchMutation.variables?.id === batch.id}
+              highlighted={batch.id === focusBatchId}
               onDispatch={(plateId) => dispatchMutation.mutate({ id: batch.id, plateId })}
               onCancel={() => setCancelTarget(batch)}
               t={t}
@@ -148,6 +157,7 @@ function BatchOrderCard({
   onDispatch,
   onCancel,
   t,
+  highlighted = false,
 }: {
   batch: PrintBatch;
   currency: string;
@@ -157,17 +167,21 @@ function BatchOrderCard({
   onDispatch: (plateId?: number | null) => void;
   onCancel: () => void;
   t: (key: string, options?: Record<string, unknown>) => string;
+  highlighted?: boolean;
 }) {
   // Progress is measured against the target, not against what was queued —
   // that is the whole difference between an order and a grouping.
   const denominator = batch.has_targets ? batch.target_count : batch.completed_count + batch.pending_count
     + batch.printing_count + batch.failed_count;
   const percent = denominator > 0 ? Math.round((batch.completed_count / denominator) * 100) : 0;
+  // Runs the order owes that nothing can produce any more: their plate's last
+  // queue item was deleted, so there is no configuration left to clone (#2960).
+  const strandedCount = batch.has_targets ? batch.remaining_count - batch.dispatchable_count : 0;
   const dueDate = batch.due_date ? parseUTCDate(batch.due_date) : null;
   const isOverdue = dueDate != null && batch.status === 'active' && dueDate.getTime() < Date.now();
 
   return (
-    <Card className="p-4">
+    <Card id={`batch-${batch.id}`} className={`p-4 ${highlighted ? 'ring-2 ring-bambu-green' : ''}`}>
       <div className="flex flex-wrap items-start gap-3 mb-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
@@ -199,13 +213,17 @@ function BatchOrderCard({
         </div>
 
         <div className="flex items-center gap-2 flex-shrink-0">
-          {batch.has_targets && batch.remaining_count > 0 && batch.status !== 'cancelled' && canDispatch && (
+          {batch.has_targets && batch.dispatchable_count > 0 && batch.status !== 'cancelled' && canDispatch && (
             <Button variant="primary" size="sm" onClick={() => onDispatch()} disabled={isDispatching}>
               <PlayCircle className="w-4 h-4 mr-1" />
-              {t('queue.batchOrders.dispatchRemaining', { count: batch.remaining_count })}
+              {t('queue.batchOrders.dispatchRemaining', { count: batch.dispatchable_count })}
             </Button>
           )}
-          {batch.status === 'active' && batch.pending_count > 0 && canCancel && (
+          {/* Cancel is the only way to close an order out, so it must not be
+              gated on there being pending items to cancel: an order whose runs
+              were all deleted has none, and is exactly the one that needs
+              closing (#2960). */}
+          {batch.status === 'active' && canCancel && (
             <Button variant="ghost" size="sm" onClick={onCancel}>
               <XCircle className="w-4 h-4 mr-1" />
               {t('queue.cancelBatch')}
@@ -264,6 +282,13 @@ function BatchOrderCard({
           </span>
         )}
       </div>
+
+      {strandedCount > 0 && batch.status !== 'cancelled' && (
+        <p className="flex items-start gap-1.5 text-xs text-orange-600 dark:text-orange-400 mb-1">
+          <AlertTriangle className="w-3 h-3 mt-0.5 flex-shrink-0" />
+          <span>{t('queue.batchOrders.strandedNotice', { runs: strandedCount, owed: batch.remaining_count })}</span>
+        </p>
+      )}
 
       {batch.has_targets && batch.plates.length > 0 && (
         <div className="mt-3 border-t border-bambu-dark-tertiary pt-3 space-y-1.5">
@@ -328,15 +353,21 @@ function PlateRow({
           <span className="text-bambu-gray">
             {t('queue.batchOrders.remaining', { count: plate.remaining })}
           </span>
-          {canDispatch && (
-            <button
-              type="button"
-              onClick={onDispatch}
-              disabled={isDispatching}
-              className="text-bambu-green hover:underline disabled:opacity-50"
-            >
-              {t('queue.batchOrders.dispatchPlate')}
-            </button>
+          {!plate.can_dispatch ? (
+            <span className="text-orange-600 dark:text-orange-400">
+              {t('queue.batchOrders.strandedPlate')}
+            </span>
+          ) : (
+            canDispatch && (
+              <button
+                type="button"
+                onClick={onDispatch}
+                disabled={isDispatching}
+                className="text-bambu-green hover:underline disabled:opacity-50"
+              >
+                {t('queue.batchOrders.dispatchPlate')}
+              </button>
+            )
           )}
         </span>
       )}

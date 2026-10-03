@@ -141,6 +141,7 @@ function isAlwaysAllowedIdentical(value) {
 // German loanwords / cognates from English are extensive. Most short technical
 // UI labels are identical in DE. List below curates the legitimate ones.
 const DE_COGNATES = [
+  'Apps',  // notifications badge for messages from connected apps — same word
   '{{ams}} · Slot {{slot}}',  // #2587 runout slot label — "Slot" is the DE term too
   'Auto',  // calibrationMode_auto — German UI uses the loanword (matches BambuStudio DE)
   'Name', 'Status', 'Tag', 'Tags', 'Online', 'Offline', 'Standard', 'Modus',
@@ -175,10 +176,12 @@ const DE_COGNATES = [
   'Diagnose',  // DE: same spelling/meaning as EN — camera diagnostic button label
   '{{filament}} @ {{temp}}°C',  // drying badge: filament code + universal °C
   'Score',  // #1546 AI detection modal — established DE loanword (Duden)
+  'Version 2',  // stream overlay artwork picker (#3177) — same word in German
 ];
 
 // French cognates — many UI labels overlap with English exactly.
 const FR_COGNATES = [
+  'Apps',  // notifications badge for messages from connected apps — same word
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
   'Status', 'Tag', 'Tags', 'Online', 'Offline', 'Standard', 'Filament',
@@ -222,6 +225,8 @@ const FR_COGNATES = [
   '{{filament}} @ {{temp}}°C',  // drying badge: filament code + universal °C
   'Simple', 'Expert',  // slicer settings visibility tiers — identical words in French
   'Support',  // same word in French
+  'Photos', '{{count}} photo', '{{count}} photos',  // file details photo strip (#3077) — same word in French
+  'Version 2',  // stream overlay artwork picker (#3177) — same word in French
 ];
 
 // Italian cognates.
@@ -275,6 +280,7 @@ const JA_COGNATES = [
 
 // Portuguese (BR) cognates.
 const PT_BR_COGNATES = [
+  'Apps',  // notifications badge for messages from connected apps — same word
   '{{ams}} · Slot {{slot}}',  // #2587 runout slot label — "Slot" is the PT-BR term too
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
@@ -350,6 +356,7 @@ const KO_COGNATES = [
 
 // Spanish cognates — words/phrases that are genuinely identical in Spanish.
 const ES_COGNATES = [
+  'Apps',  // notifications badge for messages from connected apps — same word
   '{{ams}} · Slot {{slot}}',  // #2587 runout slot label — "Slot" is the ES term too
   'Bambu Cloud', 'Orca Cloud',  // brand names — same in every locale
   'AMS Filament Backup',  // Bambu Lab product/firmware feature name
@@ -369,6 +376,26 @@ const ES_COGNATES = [
   'Avery 5160 — US Letter sheet (25.4 × 66.7 mm × 30)',
   '{{filament}} @ {{temp}}°C',  // drying badge: filament code + universal °C
   'Simple',  // slicer settings visibility tier — identical word in Spanish
+];
+
+// Swedish cognates — technical UI labels that Swedish speakers use verbatim
+// from English (loanwords + acronyms + format strings). Curated, not a shortcut.
+const SV_COGNATES = [
+  'MakerWorld: {{designer}}',
+  'email',
+  '{{printer}}: {{error}}',
+  'Bambu Cloud',
+  'Orca Cloud',
+  '{{name}} — {{stage}} ({{percent}}%) — {{elapsed}}',
+  'EC984C,#6CD4BC,A66EB9,D87694',
+  '({{count}}/8)',
+  '(25%, 50%, 75%)', 'System', 'Filament', 'Status', 'Total budget', 'Budget', 'Offline', 'Problem', 'Diameter', 'Standard',
+  'Live', 'Firmware', '{{filament}} @ {{temp}}°C', 'Standard (100%)', 'Sport (124%)', '{{weight}}g', 'Pipeline', 'Pipelines', 'Position', 'Batch', 'Timelapse', 'Online',
+  'Disk', 'STARTTLS (Port 587)', 'SSL/TLS (Port 465)', 'Start', 'Auto', 'Admin', 'Data', 'Material', 'Hex', 'Accent', 'Neutral', 'Orange', 'Rotation', 'Test',
+  'Port', '(System)', 'Autologin', 'Process', 'Filament {{n}}', 'Region', 'Global', 'Normal', 'Version', 'max {{n}}', 'Expert', 'Filament {{index}} ({{type}})', 'Material:',
+  '(Inv)', 'Original', 'Commit', 'Extruder', 'Gradient', 'Proxy', 'Metadata', '{{count}} filament', 'Temp', 'Min', 'ntfy, Pushover, Discord, etc.', 'Hex: #{{hex}}', 'Designer',
+  'Prefix', 'Trend', 'max(global {{global}}d, SKU {{sku}}d)', 'Slicer',
+  'Version 2',  // stream overlay artwork picker (#3177) — same word in Swedish
 ];
 
 // Turkish cognates — technical UI labels that Turkish speakers use verbatim
@@ -415,6 +442,47 @@ const UK_COGNATES = [
   '(25%, 50%, 75%)',
 ];
 
+// Dutch cognates. Dutch shares most technical UI vocabulary with English
+// verbatim -- printer, filament, status, nozzle, timelapse, dashboard --
+// and the slicer feature names (support, ironing, prime tower, gap fill)
+// are used untranslated by Dutch slicer users. Each entry below was
+// checked individually against the Dutch translation in #2891.
+const NL_COGNATES = [
+  'Apps',  // notifications badge for messages from connected apps — same word
+  '1 printer', '{{n}} printers',
+  '1 week', '(25%, 50%, 75%)', 'Accent', 'AMS Filament Backup',
+  '{{ams}} Slot {{slot}}', 'Auto', 'Auto Home', 'Bambu Cloud',
+  'Batch', 'Batches', 'Branch', 'Budget',
+  'Camera', 'China', 'Client Secret', 'Cloud',
+  'Commit', 'Compact', '({{count}}/8)', '{{count}} downloads',
+  '{{count}} filament', '({{count}} item)', '{{count}} item', '({{count}} items)',
+  '{{count}} items', '{{count}} object', 'Dashboard', 'Diagnose',
+  'Diameter', 'EC984C,#6CD4BC,A66EB9,D87694', 'Effect', 'email',
+  'ETA {{minutes}} min', 'Expert', 'Extruder', 'Extruders',
+  'Factor', 'Filament', 'Filament {{index}} ({{type}})', 'Filament {{n}}',
+  '{{filament}} @ {{temp}}°C', 'Filters', 'Firmware', 'Flow',
+  'Galaxy', 'Gap fill', 'Hex', 'Hex: #{{hex}}',
+  'Host', 'In browser', 'Interval', 'Interval (min)',
+  'Interval ({{type}})', 'Ironing', 'Jade White, Fire Red...', 'Label',
+  'Label...', 'LAN Developer Mode', 'Live', 'Long-Lived Access Token',
+  'Ludicrous (166%)', 'MakerWorld: {{designer}}', 'Metadata', 'Min',
+  'Model', '{{name}} — {{stage}} ({{percent}}%) — {{elapsed}}', '{{name}} - Timelapse', 'Nozzle',
+  'Nozzle 2', '{{n}} run', '{{n}} runs', 'Offline',
+  'Online', 'Open', 'Orca Cloud', 'parallel',
+  'Personal Access Token', 'Pipeline', 'Pipelines', 'Platform',
+  'Pressure Advance', 'Prime tower', 'Printer', 'Printer:',
+  '{{printer}}: {{error}}', '{{printer}} is offline', 'Printer is offline', 'Printer offline',
+  'Printers', 'Project', 'Project: {{name}}', 'Protocol',
+  'Providers', 'Provider: {{type}}', 'Proxy', 'Recent',
+  'Records', 'round robin', 'Scopes', 'Score',
+  'sets', 'Skirt / brim', 'Slicer', 'SpoolBuddy is offline',
+  'Sport (124%)', 'Start', 'Status', 'Subtype',
+  'Support', 'Tag', 'Tags', 'Temp',
+  'Timelapse', 'Topic', 'Trend', 'Type',
+  'Type:', 'Updates', 'Uptime', 'Urgent',
+  'Warm', '{{weight}}g', 'Workflow',
+];
+
 const IDENTICAL_TO_EN_ALLOWED = {
   de: new Set(DE_COGNATES),
   fr: new Set(FR_COGNATES),
@@ -425,9 +493,11 @@ const IDENTICAL_TO_EN_ALLOWED = {
   'pt-BR': new Set(PT_BR_COGNATES),
   'zh-CN': new Set(ZH_CN_COGNATES),
   'zh-TW': new Set(ZH_TW_COGNATES),
+  sv: new Set(SV_COGNATES),
   tr: new Set(TR_COGNATES),
   ru: new Set(RU_COGNATES),
   uk: new Set(UK_COGNATES),
+  nl: new Set(NL_COGNATES),
 };
 
 // Pure comparison logic, exported so tests can verify each failure mode

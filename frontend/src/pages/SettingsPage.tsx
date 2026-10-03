@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Loader2, Plus, Plug, AlertTriangle, RotateCcw, Bell, Download, RefreshCw, ExternalLink, Globe, Droplets, Thermometer, FileText, Edit2, Send, CheckCircle, XCircle, History, Trash2, Zap, TrendingUp, Calendar, DollarSign, Power, PowerOff, Key, Copy, Database, X, Shield, Printer, Cylinder, Wifi, Home, Video, Users, Lock, Unlock, ChevronDown, Save, Mail, Flame, Layers, ListOrdered, Code, Search, Scale, Settings as SettingsIcon, ScanEye, Cog, QrCode, Heart, Briefcase, Workflow, UploadCloud, MonitorPlay } from 'lucide-react';
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Loader2, Plus, Plug, AlertTriangle, RotateCcw, Bell, Download, RefreshCw, ExternalLink, Globe, Droplets, Thermometer, FileText, Edit2, Pencil, Send, CheckCircle, XCircle, History, Trash2, Zap, TrendingUp, Calendar, DollarSign, Power, PowerOff, Key, Copy, Database, X, Shield, Printer, Cylinder, Wifi, Home, Video, Users, Lock, Unlock, ChevronDown, Save, Mail, Flame, Layers, ListOrdered, Code, Search, Scale, Settings as SettingsIcon, ScanEye, Cog, QrCode, Heart, Briefcase, Workflow, UploadCloud, MonitorPlay } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '../api/client';
@@ -10,11 +10,19 @@ import { checkPasswordComplexity } from '../utils/password';
 import { fleetAudience, sponsorHref } from '../utils/fleetAudience';
 import { PRESET_CATEGORIES, parsePresetTriple } from '../utils/temperatureFanPresets';
 import { CALIBRATION_MODES, CALIBRATION_MODE_ACTIVE, CALIBRATION_MODE_INACTIVE } from '../utils/calibrationMode';
+import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
+import {
+  locationSensorReadingAlertStatus,
+  locationSensorValueColorClass,
+  useLocationSensorColorPrefs,
+} from '../utils/locationSensorDefaults';
+import { describeHASensorReading, iconForHASensor } from '../utils/haSensorDisplay';
 import { PreheatFilamentTargetsEditor } from '../components/PreheatFilamentTargetsEditor';
-import type { APIKey, AppSettings, AppSettingsUpdate, PrinterHASensor, SmartPlug, SmartPlugStatus, NotificationProvider, NotificationTemplate, UpdateStatus, GitHubBackupStatus, CloudAuthStatus, UserCreate, UserUpdate, UserResponse, StorageUsageResponse, CalibrationMode } from '../api/client';
+import type { APIKey, AppSettings, AppSettingsUpdate, PrinterHASensor, LocationHASensor, LocationHASensorReading, SmartPlug, SmartPlugStatus, NotificationProvider, NotificationTemplate, UpdateStatus, GitHubBackupStatus, CloudAuthStatus, UserCreate, UserUpdate, UserResponse, StorageUsageResponse, CalibrationMode } from '../api/client';
 import { Card, CardContent, CardDensityProvider, CardHeader } from '../components/Card';
 import { SlicerPipelinesPanel } from '../components/SlicerPipelinesPanel';
 import { CameraTokensSection } from './CameraTokensPage';
+import { ConnectedAppsSection } from '../components/ConnectedAppsSection';
 import { StreamOverlayBuilder } from '../components/StreamOverlayBuilder';
 import { Collapsible } from '../components/Collapsible';
 import { CopyButton } from '../components/CopyButton';
@@ -22,6 +30,8 @@ import { Button } from '../components/Button';
 import { SmartPlugCard } from '../components/SmartPlugCard';
 import { AddSmartPlugModal } from '../components/AddSmartPlugModal';
 import { HASensorModal } from '../components/HASensorModal';
+import { LocationHASensorModal } from '../components/LocationHASensorModal';
+import { LocationSensorOptionsModal } from '../components/LocationSensorOptionsModal';
 import { NotificationProviderCard } from '../components/NotificationProviderCard';
 import { AddNotificationModal } from '../components/AddNotificationModal';
 import { NotificationTemplateEditor } from '../components/NotificationTemplateEditor';
@@ -49,13 +59,14 @@ import { defaultNavItems, getDefaultView, setDefaultView } from '../components/L
 import { availableLanguages } from '../i18n';
 import { useToast } from '../contexts/ToastContext';
 import { useTheme, type ThemeStyle, type DarkBackground, type LightBackground, type ThemeAccent } from '../contexts/ThemeContext';
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { Gauge, Palette } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Gauge, Link2, Palette } from 'lucide-react';
 import { registerSettingsSearch, getSettingsSearchEntries } from '../lib/settingsSearch';
 import type { UsersSubTab } from '../lib/settingsSearch';
 import { availableEngines, hasEngineChoice, resolveEngine, type SliceEngineId } from '../lib/sliceEngines';
+import { NumberInput } from '../components/NumberInput';
 
-const validTabs = ['general', 'plugs', 'notifications', 'queue', 'filament', 'network', 'apikeys', 'virtual-printer', 'spoolbuddy', 'failure-detection', 'users', 'backup'] as const;
+const validTabs = ['general', 'plugs', 'sensors', 'notifications', 'queue', 'filament', 'network', 'apikeys', 'virtual-printer', 'spoolbuddy', 'failure-detection', 'users', 'backup'] as const;
 type TabType = typeof validTabs[number];
 
 // Cross-tab search registrations for cards rendered inline in this file.
@@ -70,6 +81,8 @@ registerSettingsSearch({ labelKey: 'settings.fileManager', tab: 'general', keywo
 registerSettingsSearch({ labelKey: 'settings.updates', tab: 'general', keywords: 'updates version firmware beta check', anchor: 'card-updates' });
 registerSettingsSearch({ labelKey: 'settings.dataManagement', tab: 'general', keywords: 'data reset clear logs notifications preferences', anchor: 'card-data' });
 registerSettingsSearch({ labelKey: 'settings.smartPlugs', tab: 'plugs', keywords: 'smart plug energy power automation tapo kasa tplink shelly', anchor: 'card-plugs' });
+registerSettingsSearch({ labelKey: 'haSensors.sectionTitle', tab: 'sensors', keywords: 'home assistant sensor printer temperature humidity alert notify block print', anchor: 'card-ha-sensors' });
+registerSettingsSearch({ labelKey: 'locationHaSensors.sectionTitle', tab: 'sensors', keywords: 'home assistant sensor location storage box temperature humidity battery alert notify', anchor: 'card-location-sensors' });
 registerSettingsSearch({ labelKey: 'settings.providers', tab: 'notifications', keywords: 'telegram discord email notification providers webhook', anchor: 'card-providers' });
 registerSettingsSearch({ labelKey: 'settings.messageTemplates', tab: 'notifications', keywords: 'message templates notification text edit', anchor: 'card-templates' });
 registerSettingsSearch({ labelKey: 'settings.defaultPrintOptions', labelFallback: 'Default Print Options', tab: 'queue', keywords: 'print bed leveling flow calibration vibration first layer timelapse', anchor: 'card-print-options' });
@@ -91,6 +104,7 @@ registerSettingsSearch({ labelKey: 'settings.prometheusMetrics', tab: 'network',
 registerSettingsSearch({ labelKey: 'settings.createNewApiKey', tab: 'apikeys', keywords: 'api key create permission scope', anchor: 'card-createapi' });
 registerSettingsSearch({ labelKey: 'settings.webhookEndpoints', tab: 'apikeys', keywords: 'webhook endpoint post http', anchor: 'card-webhooks' });
 registerSettingsSearch({ labelKey: 'settings.apiBrowser', tab: 'apikeys', keywords: 'api browser endpoint documentation test', anchor: 'card-apibrowser' });
+registerSettingsSearch({ labelKey: 'connectedApps.title', tab: 'apikeys', keywords: 'connected app sign in single sign-on sso oauth login orders', anchor: 'card-connected-apps' });
 registerSettingsSearch({ labelKey: 'cameraTokens.title', tab: 'apikeys', keywords: 'camera token long-lived home assistant frigate kiosk stream', anchor: 'card-camera-tokens' });
 registerSettingsSearch({ labelKey: 'settings.tabs.virtualPrinter', tab: 'virtual-printer', keywords: 'virtual printer proxy archive slicer bambustudio orcaslicer ip bind', anchor: 'card-vp' });
 registerSettingsSearch({ labelKey: 'settings.tabs.spoolbuddy', tab: 'spoolbuddy', keywords: 'spoolbuddy device scale nfc rfid kiosk unregister', anchor: 'card-spoolbuddy' });
@@ -167,6 +181,23 @@ const STORAGE_FALLBACK_COLORS = [
 const getStorageColor = (key: string, index: number) =>
   STORAGE_CATEGORY_COLORS[key] || STORAGE_FALLBACK_COLORS[index % STORAGE_FALLBACK_COLORS.length];
 
+const LOCATION_SENSOR_CATEGORY_ORDER: Record<string, number> = {
+  temperature: 0,
+  humidity: 1,
+  battery: 2,
+};
+
+// Reads the live readings endpoint (reachable-aware) rather than the sensor
+// row's last_state, so a sensor Home Assistant has stopped reporting shows
+// "Unavailable" instead of silently keeping its last value on screen forever.
+function describeLocationSensorValue(
+  reading: LocationHASensorReading | undefined,
+  t: (key: string, opts?: Record<string, unknown>) => string
+): string | null {
+  if (!reading) return null;
+  return describeHASensorReading(reading, t, { decimals: 2 });
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -189,10 +220,28 @@ export function SettingsPage() {
   // so intermediate values ("", "3", "5") are not eaten by the [5, 95] clamp
   // while the user is mid-typing.
   const [humidityDrafts, setHumidityDrafts] = useState<Record<string, string>>({});
+  // Same transient-draft treatment for the ambient-drying sustained-minutes
+  // input: committed (clamped 5..240) on blur, so clearing the field or typing
+  // an intermediate value ("", "2" on the way to "25") is not rewritten by the
+  // clamp mid-keystroke. Empty/non-numeric on blur reverts to the saved value.
+  const [sustainedDraft, setSustainedDraft] = useState<string | null>(null);
   const [showPlugModal, setShowPlugModal] = useState(false);
   const [editingPlug, setEditingPlug] = useState<SmartPlug | null>(null);
   const [showHASensorModal, setShowHASensorModal] = useState(false);
   const [editingHASensor, setEditingHASensor] = useState<PrinterHASensor | null>(null);
+  const [showLocationHASensorModal, setShowLocationHASensorModal] = useState(false);
+  const [editingLocationHASensor, setEditingLocationHASensor] = useState<LocationHASensor | null>(null);
+  const [showLocationSensorOptionsModal, setShowLocationSensorOptionsModal] = useState(false);
+  const {
+    colorize: colorizeLocationSensorValues,
+    aboveColor: locationSensorAboveColor,
+    belowColor: locationSensorBelowColor,
+    optimalColor: locationSensorOptimalColor,
+  } = useLocationSensorColorPrefs();
+  const [deleteLocationSensorsTarget, setDeleteLocationSensorsTarget] = useState<{
+    locationName: string;
+    sensorIds: number[];
+  } | null>(null);
   const [showNotificationModal, setShowNotificationModal] = useState(false);
   const [editingProvider, setEditingProvider] = useState<NotificationProvider | null>(null);
   const [editingTemplate, setEditingTemplate] = useState<NotificationTemplate | null>(null);
@@ -256,6 +305,7 @@ export function SettingsPage() {
     can_manage_projects: true,
     can_access_cloud: false,
     can_update_energy_cost: false,
+    can_send_notifications: false,
   });
   const [createdAPIKey, setCreatedAPIKey] = useState<string | null>(null);
   const [showApiKeyQR, setShowApiKeyQR] = useState(false);
@@ -453,7 +503,73 @@ export function SettingsPage() {
   const { data: haSensors } = useQuery({
     queryKey: ['haSensors'],
     queryFn: () => api.getHASensors(),
-    enabled: activeTab === 'plugs',
+  });
+
+  // Not polled — this is the sensor list (for the badge count and the
+  // section below), not live readings. It only changes via create/edit/
+  // delete, which already invalidate this key.
+  const { data: locationHaSensors } = useQuery({
+    queryKey: ['locationHaSensors'],
+    queryFn: () => api.getLocationHASensors(),
+  });
+
+  const { data: haSensorLocations } = useQuery({
+    queryKey: inventoryLocationsQueryKey,
+    queryFn: api.getLocations,
+    enabled: activeTab === 'sensors',
+  });
+
+  const locationSensorLocationIds = useMemo(
+    () => Array.from(new Set((locationHaSensors ?? []).map((s) => s.location_id))),
+    [locationHaSensors]
+  );
+
+  // Live readings (reachable-aware), fetched per location the same way
+  // InventoryPage's table view and SpoolLocationFooter do — false to get
+  // every bound sensor here, not just the ones marked to show on the
+  // filament card. Same query key as those two (no 'all'/'cardOnly' suffix),
+  // so navigating here after Inventory has already fetched a location is a
+  // cache hit instead of a second request; navigating back does the same
+  // for Inventory. Only runs while this tab is actually open.
+  const locationSensorReadingsQueries = useQueries({
+    queries: locationSensorLocationIds.map((locationId) => ({
+      queryKey: ['locationHaSensorReadings', locationId],
+      queryFn: () => api.getLocationHASensorReadings(locationId, false),
+      enabled: activeTab === 'sensors',
+      refetchInterval: activeTab === 'sensors' ? (settings?.location_sensor_poll_interval || 120) * 1000 : false,
+    })),
+  });
+
+  const locationSensorReadingsById = useMemo(() => {
+    const map = new Map<number, LocationHASensorReading>();
+    for (const query of locationSensorReadingsQueries) {
+      for (const reading of query.data ?? []) map.set(reading.id, reading);
+    }
+    return map;
+  }, [locationSensorReadingsQueries]);
+
+  const deleteLocationSensorsMutation = useMutation({
+    mutationFn: async (sensorIds: number[]) => {
+      for (const id of sensorIds) {
+        await api.deleteLocationHASensor(id);
+      }
+    },
+    onSuccess: () => {
+      showToast(t('locationHaSensors.toast.deleted'), 'success');
+    },
+    onError: (err: Error) => {
+      showToast(err.message, 'error');
+    },
+    // The mutation deletes sequentially; a failure partway through has
+    // already deleted some sensors on the backend, so the cache needs
+    // refreshing whether the mutation as a whole succeeded or failed —
+    // otherwise the ones that did go through stay on screen as if nothing
+    // happened.
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['locationHaSensors'] });
+      queryClient.invalidateQueries({ queryKey: ['locationHaSensorReadings'] });
+      setDeleteLocationSensorsTarget(null);
+    },
   });
 
   // A business-sized fleet gets the commercial ask instead of the donation ask.
@@ -974,6 +1090,13 @@ export function SettingsPage() {
       // re-compare the updated `settings` with current `localSettings` and
       // debounce-save any remaining differences.
       queryClient.invalidateQueries({ queryKey: ['archiveStats'] });
+      // /settings/ui-flags serves currency and the sidebar gates to users who
+      // cannot read /settings. Nothing invalidated it, so a currency change
+      // sat behind that query's own staleTime instead of showing up (#3123).
+      queryClient.invalidateQueries({ queryKey: ['ui-flags'] });
+      // Switching announcements off (or to all users) changes who sees the
+      // sidebar entry and the banner; don't wait for the next poll.
+      queryClient.invalidateQueries({ queryKey: ['announcements'] });
       showToast(t('settings.toast.settingsSaved'), 'success');
     },
     onError: (error: Error) => {
@@ -1033,6 +1156,8 @@ export function SettingsPage() {
       baseline.check_updates !== localSettings.check_updates ||
       (baseline.check_printer_firmware ?? true) !== (localSettings.check_printer_firmware ?? true) ||
       (baseline.include_beta_updates ?? false) !== (localSettings.include_beta_updates ?? false) ||
+      (baseline.announcements_enabled ?? true) !== (localSettings.announcements_enabled ?? true) ||
+      (baseline.announcements_all_users ?? false) !== (localSettings.announcements_all_users ?? false) ||
       (baseline.local_login_enabled ?? true) !== (localSettings.local_login_enabled ?? true) ||
       baseline.notification_language !== localSettings.notification_language ||
       (baseline.bed_cooled_threshold ?? 35) !== (localSettings.bed_cooled_threshold ?? 35) ||
@@ -1040,12 +1165,14 @@ export function SettingsPage() {
       baseline.ams_humidity_fair !== localSettings.ams_humidity_fair ||
       baseline.ams_temp_good !== localSettings.ams_temp_good ||
       baseline.ams_temp_fair !== localSettings.ams_temp_fair ||
+      (baseline.ams_temp_alarm ?? null) !== (localSettings.ams_temp_alarm ?? null) ||
       baseline.ams_history_retention_days !== localSettings.ams_history_retention_days ||
       baseline.disable_filament_warnings !== localSettings.disable_filament_warnings ||
       baseline.prefer_lowest_filament !== localSettings.prefer_lowest_filament ||
       (baseline.queue_drying_enabled ?? false) !== (localSettings.queue_drying_enabled ?? false) ||
       (baseline.queue_drying_block ?? false) !== (localSettings.queue_drying_block ?? false) ||
       (baseline.ambient_drying_enabled ?? false) !== (localSettings.ambient_drying_enabled ?? false) ||
+      (baseline.ambient_drying_sustained_minutes ?? 0) !== (localSettings.ambient_drying_sustained_minutes ?? 0) ||
       (baseline.print_drying_enabled ?? false) !== (localSettings.print_drying_enabled ?? false) ||
       (baseline.drying_presets ?? '') !== (localSettings.drying_presets ?? '') ||
       (baseline.ams_humidity_thresholds ?? '') !== (localSettings.ams_humidity_thresholds ?? '') ||
@@ -1086,6 +1213,9 @@ export function SettingsPage() {
       (baseline.default_layer_inspect ?? false) !== (localSettings.default_layer_inspect ?? false) ||
       (baseline.default_timelapse ?? false) !== (localSettings.default_timelapse ?? false) ||
       (baseline.default_nozzle_offset_cali ?? 'auto') !== (localSettings.default_nozzle_offset_cali ?? 'auto') ||
+      (baseline.default_confirm_outcome ?? false) !== (localSettings.default_confirm_outcome ?? false) ||
+      (baseline.confirm_outcome_external_prints ?? false) !== (localSettings.confirm_outcome_external_prints ?? false) ||
+      (baseline.confirm_default_good_on_plate_clear ?? false) !== (localSettings.confirm_default_good_on_plate_clear ?? false) ||
       (baseline.stagger_group_size ?? 2) !== (localSettings.stagger_group_size ?? 2) ||
       (baseline.stagger_interval_minutes ?? 5) !== (localSettings.stagger_interval_minutes ?? 5) ||
       (baseline.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false) ||
@@ -1144,6 +1274,8 @@ export function SettingsPage() {
         check_updates: localSettings.check_updates,
         check_printer_firmware: localSettings.check_printer_firmware,
         include_beta_updates: localSettings.include_beta_updates,
+        announcements_enabled: localSettings.announcements_enabled ?? true,
+        announcements_all_users: localSettings.announcements_all_users ?? false,
         local_login_enabled: localSettings.local_login_enabled,
         notification_language: localSettings.notification_language,
         bed_cooled_threshold: localSettings.bed_cooled_threshold,
@@ -1151,12 +1283,14 @@ export function SettingsPage() {
         ams_humidity_fair: localSettings.ams_humidity_fair,
         ams_temp_good: localSettings.ams_temp_good,
         ams_temp_fair: localSettings.ams_temp_fair,
+        ams_temp_alarm: localSettings.ams_temp_alarm ?? null,
         ams_history_retention_days: localSettings.ams_history_retention_days,
         disable_filament_warnings: localSettings.disable_filament_warnings,
         prefer_lowest_filament: localSettings.prefer_lowest_filament,
         queue_drying_enabled: localSettings.queue_drying_enabled,
         queue_drying_block: localSettings.queue_drying_block,
         ambient_drying_enabled: localSettings.ambient_drying_enabled,
+        ambient_drying_sustained_minutes: localSettings.ambient_drying_sustained_minutes,
         print_drying_enabled: localSettings.print_drying_enabled,
         drying_presets: localSettings.drying_presets,
         ams_humidity_thresholds: localSettings.ams_humidity_thresholds,
@@ -1197,6 +1331,9 @@ export function SettingsPage() {
         default_layer_inspect: localSettings.default_layer_inspect,
         default_timelapse: localSettings.default_timelapse,
         default_nozzle_offset_cali: localSettings.default_nozzle_offset_cali,
+        default_confirm_outcome: localSettings.default_confirm_outcome,
+        confirm_outcome_external_prints: localSettings.confirm_outcome_external_prints,
+        confirm_default_good_on_plate_clear: localSettings.confirm_default_good_on_plate_clear,
         stagger_group_size: localSettings.stagger_group_size,
         stagger_interval_minutes: localSettings.stagger_interval_minutes,
         require_plate_clear: localSettings.require_plate_clear,
@@ -1458,7 +1595,7 @@ export function SettingsPage() {
 
       {/* Tab Navigation + content: horizontal tabs on mobile, vertical rail on lg+ */}
       <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
-      <nav className="flex flex-wrap gap-1 border-b border-bambu-dark-tertiary lg:flex-col lg:flex-nowrap lg:gap-0 lg:border-b-0 lg:border-r lg:w-48 lg:flex-shrink-0 lg:self-start lg:sticky lg:top-4">
+      <nav className="flex flex-wrap gap-1 border-b border-bambu-dark-tertiary lg:flex-col lg:flex-nowrap lg:gap-0 lg:border-b-0 lg:border-r lg:w-60 lg:flex-shrink-0 lg:self-start lg:sticky lg:top-4">
         <button
           onClick={() => handleTabChange('general')}
           className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
@@ -1467,7 +1604,7 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <SettingsIcon className="w-4 h-4" />
+          <SettingsIcon className="w-4 h-4 shrink-0" />
           {t('settings.tabs.general')}
         </button>
         <button
@@ -1478,11 +1615,27 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Plug className="w-4 h-4" />
+          <Plug className="w-4 h-4 shrink-0" />
           {t('settings.tabs.smartPlugs')}
           {smartPlugs && smartPlugs.length > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
+            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full shrink-0">
               {smartPlugs.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => handleTabChange('sensors')}
+          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
+            activeTab === 'sensors'
+              ? 'text-bambu-green border-bambu-green'
+              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
+          }`}
+        >
+          <Gauge className="w-4 h-4 shrink-0" />
+          {t('settings.tabs.sensors')}
+          {(haSensors?.length ?? 0) + (locationHaSensors?.length ?? 0) > 0 && (
+            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full shrink-0">
+              {(haSensors?.length ?? 0) + (locationHaSensors?.length ?? 0)}
             </span>
           )}
         </button>
@@ -1494,10 +1647,10 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Bell className="w-4 h-4" />
+          <Bell className="w-4 h-4 shrink-0" />
           {t('settings.tabs.notifications')}
           {notificationProviders && notificationProviders.length > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
+            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full shrink-0">
               {notificationProviders.length}
             </span>
           )}
@@ -1510,7 +1663,7 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <ListOrdered className="w-4 h-4" />
+          <ListOrdered className="w-4 h-4 shrink-0" />
           {t('settings.tabs.queue', 'Workflow')}
         </button>
         <button
@@ -1521,7 +1674,7 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Cylinder className="w-4 h-4" />
+          <Cylinder className="w-4 h-4 shrink-0" />
           {t('settings.tabs.filament')}
         </button>
         <button
@@ -1532,9 +1685,9 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Wifi className="w-4 h-4" />
+          <Wifi className="w-4 h-4 shrink-0" />
           {t('settings.tabs.network')}
-          <span className={`w-2 h-2 rounded-full ${mqttStatus?.enabled ? 'bg-green-400' : 'bg-gray-500'}`} />
+          <span className={`w-2 h-2 rounded-full shrink-0 ${mqttStatus?.enabled ? 'bg-green-400' : 'bg-gray-500'}`} />
         </button>
         <button
           onClick={() => handleTabChange('apikeys')}
@@ -1544,10 +1697,10 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Key className="w-4 h-4" />
+          <Key className="w-4 h-4 shrink-0" />
           {t('settings.tabs.apiKeys')}
           {apiKeys && apiKeys.length > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
+            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full shrink-0">
               {apiKeys.length}
             </span>
           )}
@@ -1560,9 +1713,9 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Printer className="w-4 h-4" />
+          <Printer className="w-4 h-4 shrink-0" />
           {t('settings.tabs.virtualPrinter')}
-          <span className={`w-2 h-2 rounded-full ${virtualPrinterRunning ? 'bg-green-400' : 'bg-gray-500'}`} />
+          <span className={`w-2 h-2 rounded-full shrink-0 ${virtualPrinterRunning ? 'bg-green-400' : 'bg-gray-500'}`} />
         </button>
         <button
           onClick={() => handleTabChange('spoolbuddy')}
@@ -1572,14 +1725,14 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Scale className="w-4 h-4" />
+          <Scale className="w-4 h-4 shrink-0" />
           {t('settings.tabs.spoolbuddy')}
           {spoolbuddyDeviceCount > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
+            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full shrink-0">
               {spoolbuddyDeviceCount}
             </span>
           )}
-          <span className={`w-2 h-2 rounded-full ${spoolbuddyAnyOnline ? 'bg-green-400' : 'bg-gray-500'}`} />
+          <span className={`w-2 h-2 rounded-full shrink-0 ${spoolbuddyAnyOnline ? 'bg-green-400' : 'bg-gray-500'}`} />
         </button>
         <button
           onClick={() => handleTabChange('failure-detection')}
@@ -1589,9 +1742,9 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <ScanEye className="w-4 h-4" />
+          <ScanEye className="w-4 h-4 shrink-0" />
           {t('settings.tabs.failureDetection')}
-          <span className={`w-2 h-2 rounded-full ${obicoActive ? 'bg-green-400' : 'bg-gray-500'}`} />
+          <span className={`w-2 h-2 rounded-full shrink-0 ${obicoActive ? 'bg-green-400' : 'bg-gray-500'}`} />
         </button>
         <button
           onClick={() => handleTabChange('users')}
@@ -1601,10 +1754,10 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Users className="w-4 h-4" />
+          <Users className="w-4 h-4 shrink-0" />
           {t('settings.tabs.users')}
           {authEnabled && (
-            <span className="w-2 h-2 rounded-full bg-green-400" />
+            <span className="w-2 h-2 rounded-full shrink-0 bg-green-400" />
           )}
         </button>
         <button
@@ -1615,9 +1768,9 @@ export function SettingsPage() {
               : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
           }`}
         >
-          <Database className="w-4 h-4" />
+          <Database className="w-4 h-4 shrink-0" />
           {t('settings.tabs.backup')}
-          <span className={`w-2 h-2 rounded-full ${(cloudAuthStatus?.is_authenticated && githubBackupStatus?.configured && githubBackupStatus?.enabled) || settings?.local_backup_enabled ? 'bg-green-400' : 'bg-gray-500'}`} />
+          <span className={`w-2 h-2 rounded-full shrink-0 ${(cloudAuthStatus?.is_authenticated && githubBackupStatus?.configured && githubBackupStatus?.enabled) || settings?.local_backup_enabled ? 'bg-green-400' : 'bg-gray-500'}`} />
         </button>
       </nav>
       <div className="flex-1 min-w-0">
@@ -2270,14 +2423,13 @@ export function SettingsPage() {
                   <span className="absolute left-3 top-1/2 -translate-y-1/2 text-bambu-gray text-sm pointer-events-none">
                     {getCurrencySymbol(localSettings.currency)}
                   </span>
-                  <input
-                    type="number"
+                  <NumberInput
                     step="0.01"
-                    min="0"
+                    min={0}
                     value={localSettings.default_filament_cost}
-                    onChange={(e) =>
-                      updateSetting('default_filament_cost', parseFloat(e.target.value) || 0)
-                    }
+                    onChange={(v) => updateSetting('default_filament_cost', v)}
+                    integer={false}
+                    fallback={0}
                     style={{ paddingLeft: `${Math.max(2, getCurrencySymbol(localSettings.currency).length * 0.6 + 1)}rem` }}
                     className="w-full pr-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                   />
@@ -2291,14 +2443,13 @@ export function SettingsPage() {
                   <span className="absolute left-3 top-1/2 -translate-y-1/2 text-bambu-gray text-sm pointer-events-none">
                     {getCurrencySymbol(localSettings.currency)}
                   </span>
-                  <input
-                    type="number"
+                  <NumberInput
                     step="0.001"
-                    min="0"
+                    min={0}
                     value={localSettings.energy_cost_per_kwh}
-                    onChange={(e) =>
-                      updateSetting('energy_cost_per_kwh', parseFloat(e.target.value) || 0)
-                    }
+                    onChange={(v) => updateSetting('energy_cost_per_kwh', v)}
+                    integer={false}
+                    fallback={0}
                     style={{ paddingLeft: `${Math.max(2, getCurrencySymbol(localSettings.currency).length * 0.6 + 1)}rem` }}
                     className="w-full pr-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                   />
@@ -2504,13 +2655,14 @@ export function SettingsPage() {
                   {t('settings.lowDiskSpaceWarning')}
                 </label>
                 <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min="0.5"
-                    max="100"
+                  <NumberInput
+                    min={0.5}
+                    max={100}
                     step="0.5"
                     value={localSettings.library_disk_warning_gb ?? 5}
-                    onChange={(e) => updateSetting('library_disk_warning_gb', parseFloat(e.target.value) || 5)}
+                    onChange={(v) => updateSetting('library_disk_warning_gb', v)}
+                    integer={false}
+                    fallback={5}
                     className="w-24 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                   />
                   <span className="text-bambu-gray">GB</span>
@@ -2958,6 +3110,52 @@ export function SettingsPage() {
                   </p>
                 ) : null}
               </div>
+              <div className="border-t border-bambu-dark-tertiary pt-4">
+                <p className="text-xs font-medium text-bambu-gray uppercase tracking-wider mb-4">{t('announcements.title')}</p>
+              </div>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-white">{t('settings.announcementsEnabled')}</p>
+                  <p className="text-sm text-bambu-gray">
+                    {t('settings.announcementsEnabledDesc')}{' '}
+                    <a
+                      href="https://wiki.bambuddy.cool/features/announcements/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-bambu-green hover:underline"
+                    >
+                      {t('settings.announcementsLearnMore')}
+                    </a>
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.announcements_enabled ?? true}
+                    onChange={(e) => updateSetting('announcements_enabled', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+              <div className={`flex items-center justify-between ${localSettings.announcements_enabled === false ? 'opacity-50' : ''}`}>
+                <div>
+                  <p className="text-white">{t('settings.announcementsAllUsers')}</p>
+                  <p className="text-sm text-bambu-gray">
+                    {t('settings.announcementsAllUsersDesc')}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.announcements_all_users ?? false}
+                    onChange={(e) => updateSetting('announcements_all_users', e.target.checked)}
+                    disabled={localSettings.announcements_enabled === false}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
             </CardContent>
           </Card>
 
@@ -3307,12 +3505,12 @@ export function SettingsPage() {
                       <label className="block text-sm text-bambu-gray mb-1">
                         {t('settings.port')}
                       </label>
-                      <input
-                        type="number"
-                        min="1"
-                        max="65535"
+                      <NumberInput
+                        min={1}
+                        max={65535}
                         value={localSettings.mqtt_port ?? 1883}
-                        onChange={(e) => updateSetting('mqtt_port', Math.min(65535, Math.max(1, parseInt(e.target.value) || 1883)))}
+                        onChange={(v) => updateSetting('mqtt_port', v)}
+                        fallback={1883}
                         className="w-24 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                       />
                     </div>
@@ -3690,11 +3888,12 @@ export function SettingsPage() {
               </CardContent>
             </Card>
           )}
+        </div>
+      )}
 
-          {/* Home Assistant sensors (#1148, #448). Sits under the plugs on the
-              same tab: same integration, same credentials, but read-only —
-              these are contacts and thermometers, not switches. */}
-          <div className="mt-8">
+      {activeTab === 'sensors' && (
+        <div id="card-sensors">
+          <div id="card-ha-sensors">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-white flex items-center gap-2">
                 <Gauge className="w-5 h-5 text-bambu-green" />
@@ -3767,6 +3966,174 @@ export function SettingsPage() {
                   <div className="text-center text-bambu-gray">
                     <Gauge className="w-12 h-12 mx-auto mb-3 opacity-30" />
                     <p className="text-sm">{t('haSensors.empty')}</p>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </div>
+
+          <div id="card-location-sensors" className="mt-8">
+            <div className="flex items-start justify-between gap-[20px] mb-4">
+              <div>
+                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                  <Gauge className="w-5 h-5 text-bambu-green" />
+                  {t('locationHaSensors.sectionTitle')}
+                </h2>
+                <p className="text-sm text-bambu-gray mt-1">
+                  {t('locationHaSensors.sectionDescription')}
+                </p>
+              </div>
+              <div className="flex items-center gap-2 pt-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowLocationSensorOptionsModal(true)}
+                  className="p-2 rounded-lg bg-bambu-dark-tertiary hover:bg-bambu-gray-dark text-white transition-colors"
+                  title={t('locationHaSensors.options.buttonLabel')}
+                  aria-label={t('locationHaSensors.options.buttonLabel')}
+                >
+                  <Cog className="w-4 h-4" />
+                </button>
+                <Button
+                  className="whitespace-nowrap"
+                  disabled={!haSensorLocations?.length}
+                  onClick={() => {
+                    setEditingLocationHASensor(null);
+                    setShowLocationHASensorModal(true);
+                  }}
+                >
+                  <Plus className="w-4 h-4" />
+                  {t('locationHaSensors.add')}
+                </Button>
+              </div>
+            </div>
+
+            {locationHaSensors && locationHaSensors.length > 0 ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {(() => {
+                  // Card order follows haSensorLocations (already sorted
+                  // naturally by the backend — "Drybox 2" before "Drybox
+                  // 10"), not the Map's insertion order, which is whatever
+                  // order the sensors themselves happened to be created in.
+                  const locationOrder = new Map((haSensorLocations ?? []).map((l, i) => [l.id, i]));
+                  const grouped = locationHaSensors.reduce((map, sensor) => {
+                    const list = map.get(sensor.location_id) ?? [];
+                    list.push(sensor);
+                    map.set(sensor.location_id, list);
+                    return map;
+                  }, new Map<number, LocationHASensor[]>());
+                  return Array.from(grouped.entries()).sort(
+                    ([a], [b]) =>
+                      (locationOrder.get(a) ?? Number.MAX_SAFE_INTEGER) -
+                      (locationOrder.get(b) ?? Number.MAX_SAFE_INTEGER)
+                  );
+                })().map(([locationId, unsortedSensors]) => {
+                  const location = haSensorLocations?.find((l) => l.id === locationId);
+                  const iconForSensor = (sensor: LocationHASensor) =>
+                    iconForHASensor({ device_class: sensor.device_class, state: sensor.last_state, kind: sensor.kind });
+                  const sensors = [...unsortedSensors].sort(
+                    (a, b) =>
+                      (LOCATION_SENSOR_CATEGORY_ORDER[a.device_class ?? ''] ?? 99) -
+                      (LOCATION_SENSOR_CATEGORY_ORDER[b.device_class ?? ''] ?? 99)
+                  );
+                  return (
+                    <Card key={locationId}>
+                      <CardContent className="py-4">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="text-white font-medium truncate">
+                            {location?.name ?? t('locationHaSensors.unknownLocation')}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setDeleteLocationSensorsTarget({
+                                locationName: location?.name ?? t('locationHaSensors.unknownLocation'),
+                                sensorIds: sensors.map((sensor) => sensor.id),
+                              })
+                            }
+                            className="p-1 text-bambu-gray hover:text-red-500 rounded transition-colors shrink-0"
+                            title={t('common.delete')}
+                            aria-label={t('common.delete')}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        <div className="mt-2 space-y-1.5">
+                          {sensors.map((sensor) => {
+                            const Icon = iconForSensor(sensor);
+                            const reading = locationSensorReadingsById.get(sensor.id);
+                            const value = describeLocationSensorValue(reading, t);
+                            const alertStatus =
+                              colorizeLocationSensorValues && reading ? locationSensorReadingAlertStatus(reading) : null;
+                            const valueColor =
+                              locationSensorValueColorClass(
+                                alertStatus,
+                                locationSensorAboveColor,
+                                locationSensorBelowColor,
+                                locationSensorOptimalColor
+                              ) || 'text-white';
+                            return (
+                              <div key={sensor.id} className="flex items-center min-w-0 text-xs text-bambu-gray">
+                                <Icon className="w-3.5 h-3.5 shrink-0 mr-1.5" />
+                                {value && <span className={`${valueColor} shrink-0 w-[52px] text-center`}>{value}</span>}
+                                {value && <span className="shrink-0 mr-1.5">-</span>}
+                                <span className="truncate mr-1.5" title={sensor.name}>
+                                  {sensor.entity_id}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingLocationHASensor(sensor);
+                                    setShowLocationHASensorModal(true);
+                                  }}
+                                  className="p-1 text-bambu-gray hover:text-white rounded transition-colors shrink-0"
+                                  title={t('common.edit')}
+                                  aria-label={t('common.edit')}
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div className="flex flex-wrap gap-1 mt-3">
+                          {(() => {
+                            const notifying = sensors.filter((sensor) => sensor.notify_on_alert);
+                            if (!notifying.length) return null;
+                            return (
+                              <span className="flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400">
+                                {t('haSensors.badgeNotifies')}
+                                {notifying.map((sensor) => {
+                                  const Icon = iconForSensor(sensor);
+                                  return <Icon key={sensor.id} className="w-3 h-3" />;
+                                })}
+                              </span>
+                            );
+                          })()}
+                          {(() => {
+                            const hidden = sensors.filter((sensor) => !sensor.show_on_card);
+                            if (!hidden.length) return null;
+                            return (
+                              <span className="flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-bambu-dark-tertiary text-bambu-gray">
+                                {t('haSensors.badgeHidden')}
+                                {hidden.map((sensor) => {
+                                  const Icon = iconForSensor(sensor);
+                                  return <Icon key={sensor.id} className="w-3 h-3" />;
+                                })}
+                              </span>
+                            );
+                          })()}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+            ) : (
+              <Card>
+                <CardContent className="py-8">
+                  <div className="text-center text-bambu-gray">
+                    <Gauge className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                    <p className="text-sm">{t('locationHaSensors.empty')}</p>
                   </div>
                 </CardContent>
               </Card>
@@ -4328,6 +4695,18 @@ export function SettingsPage() {
                           <p className="text-xs text-bambu-gray">{t('settings.updateEnergyCostDescription')}</p>
                         </div>
                       </label>
+                      <label className="flex items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={newAPIKeyPermissions.can_send_notifications}
+                          onChange={(e) => setNewAPIKeyPermissions(prev => ({ ...prev, can_send_notifications: e.target.checked }))}
+                          className="w-4 h-4 text-bambu-green rounded border-bambu-dark-tertiary bg-bambu-dark focus:ring-bambu-green"
+                        />
+                        <div>
+                          <span className="text-white">{t('settings.sendNotifications')}</span>
+                          <p className="text-xs text-bambu-gray">{t('settings.sendNotificationsDescription')}</p>
+                        </div>
+                      </label>
                     </div>
                   </div>
                   <div className="flex items-center gap-2 pt-2">
@@ -4405,6 +4784,9 @@ export function SettingsPage() {
                             )}
                             {key.can_update_energy_cost && (
                               <span className="px-1.5 py-0.5 bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-400 rounded">{t('settings.energyCostBadge')}</span>
+                            )}
+                            {key.can_send_notifications && (
+                              <span className="px-1.5 py-0.5 bg-sky-100 dark:bg-sky-500/20 text-sky-700 dark:text-sky-400 rounded">{t('settings.sendNotificationsBadge')}</span>
                             )}
                             {key.user_id === null && (
                               <span
@@ -4488,6 +4870,22 @@ export function SettingsPage() {
               </CardContent>
             </Card>
             </>}
+
+            {/* Connected apps: "Sign in with Bambuddy" for external applications.
+                Admin-only, like the settings it sits between. */}
+            {hasPermission('settings:update') && (
+              <Card className="mt-6">
+                <CardHeader>
+                  <h3 className="text-base font-semibold text-white flex items-center gap-2" id="card-connected-apps">
+                    <Link2 className="w-4 h-4 text-bambu-green" />
+                    {t('connectedApps.title')}
+                  </h3>
+                </CardHeader>
+                <CardContent>
+                  <ConnectedAppsSection />
+                </CardContent>
+              </Card>
+            )}
 
             {/* Long-lived camera-stream tokens (#1108) */}
             <Card className="mt-6">
@@ -4623,6 +5021,7 @@ export function SettingsPage() {
                 { key: 'default_layer_inspect' as const, label: t('settings.defaultLayerInspect', 'First Layer Inspection'), desc: t('settings.defaultLayerInspectDesc', 'AI inspection of first layer'), fallback: false, dualNozzleOnly: false, tristate: false },
                 { key: 'default_timelapse' as const, label: t('settings.defaultTimelapse', 'Timelapse'), desc: t('settings.defaultTimelapseDesc', 'Record timelapse video'), fallback: false, dualNozzleOnly: false, tristate: false },
                 { key: 'default_nozzle_offset_cali' as const, label: t('settings.defaultNozzleOffsetCali', 'Nozzle Offset Calibration'), desc: t('settings.defaultNozzleOffsetCaliDesc', 'Calibrate nozzle offsets between extruders'), fallback: true, dualNozzleOnly: true, tristate: true },
+                { key: 'default_confirm_outcome' as const, label: t('settings.defaultConfirmOutcome', 'Ask for Outcome'), desc: t('settings.defaultConfirmOutcomeDesc', 'Ask whether the print came out well after it completes'), fallback: false, dualNozzleOnly: false, tristate: false },
               ]
               .filter(({ dualNozzleOnly }) => !dualNozzleOnly || (printers || []).some(p => p.nozzle_count === 2))
               .map(({ key, label, desc, fallback, tristate }) => (
@@ -4674,6 +5073,27 @@ export function SettingsPage() {
                   )}
                 </div>
               ))}
+              {/* Prints Bambuddy only archived, never dispatched, carry no
+                  queue item to read the ask-for-outcome flag from (#1898). */}
+              <div className="flex items-center justify-between">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.confirmOutcomeExternalPrints', 'Also ask for prints started outside Bambuddy')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-0.5">
+                    {t('settings.confirmOutcomeExternalPrintsDesc', 'Prints started at the printer, in Bambu Studio or in the Handy app are archived by Bambuddy too. With this on, they get the same outcome prompt as queued prints.')}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.confirm_outcome_external_prints ?? false}
+                    onChange={(e) => updateSetting('confirm_outcome_external_prints', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
             </CardContent>
           </Card>
 
@@ -4700,6 +5120,27 @@ export function SettingsPage() {
                     type="checkbox"
                     checked={localSettings.require_plate_clear ?? false}
                     onChange={(e) => updateSetting('require_plate_clear', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+              {/* Post-print outcome confirmation (#1898): default unanswered
+                  prompts to "good" the moment the plate is released. */}
+              <div className="flex items-center justify-between">
+                <div className="flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.confirmDefaultGoodOnPlateClear', 'Count unanswered outcomes as good on plate release')}
+                  </p>
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.confirmDefaultGoodOnPlateClearDescription', 'When the plate is released (manually or by the next queued print) and the print\'s outcome prompt is still unanswered, record it as a good part automatically. The print then counts as good as soon as the plate is released; a Telegram or link answer after that only shows the recorded result.')}
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={localSettings.confirm_default_good_on_plate_clear ?? false}
+                    onChange={(e) => updateSetting('confirm_default_good_on_plate_clear', e.target.checked)}
                     className="sr-only peer"
                   />
                   <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
@@ -4794,12 +5235,12 @@ export function SettingsPage() {
                   <label className="block text-xs text-bambu-gray mb-1">
                     {t('settings.staggerGroupSize', 'Group size')}
                   </label>
-                  <input
-                    type="number"
+                  <NumberInput
                     min={1}
                     max={50}
                     value={localSettings.stagger_group_size ?? 2}
-                    onChange={(e) => updateSetting('stagger_group_size', Math.max(1, Math.min(50, parseInt(e.target.value) || 1)))}
+                    onChange={(v) => updateSetting('stagger_group_size', v)}
+                    fallback={1}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
@@ -4810,12 +5251,12 @@ export function SettingsPage() {
                   <label className="block text-xs text-bambu-gray mb-1">
                     {t('settings.staggerInterval', 'Interval (minutes)')}
                   </label>
-                  <input
-                    type="number"
+                  <NumberInput
                     min={1}
                     max={60}
                     value={localSettings.stagger_interval_minutes ?? 5}
-                    onChange={(e) => updateSetting('stagger_interval_minutes', Math.max(1, Math.min(60, parseInt(e.target.value) || 1)))}
+                    onChange={(v) => updateSetting('stagger_interval_minutes', v)}
+                    fallback={1}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
@@ -4842,12 +5283,12 @@ export function SettingsPage() {
                 <label className="block text-xs text-bambu-gray mb-1">
                   {t('settings.concurrentUploadsLabel', 'Printers uploaded to at once')}
                 </label>
-                <input
-                  type="number"
+                <NumberInput
                   min={1}
                   max={16}
                   value={localSettings.queue_max_concurrent_uploads ?? 4}
-                  onChange={(e) => updateSetting('queue_max_concurrent_uploads', Math.max(1, Math.min(16, parseInt(e.target.value) || 1)))}
+                  onChange={(v) => updateSetting('queue_max_concurrent_uploads', v)}
+                  fallback={1}
                   className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                 />
                 <p className="text-xs text-bambu-gray mt-1">
@@ -4893,12 +5334,12 @@ export function SettingsPage() {
                   <label className="block text-xs text-bambu-gray mb-1">
                     {t('settings.preheatMaxWait', 'Max wait (seconds)')}
                   </label>
-                  <input
-                    type="number"
+                  <NumberInput
                     min={60}
                     max={3600}
                     value={localSettings.preheat_max_wait_seconds ?? 900}
-                    onChange={(e) => updateSetting('preheat_max_wait_seconds', Math.max(60, Math.min(3600, parseInt(e.target.value) || 900)))}
+                    onChange={(v) => updateSetting('preheat_max_wait_seconds', v)}
+                    fallback={900}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green disabled:opacity-50"
                     disabled={!(localSettings.preheat_enabled ?? false)}
                   />
@@ -4910,12 +5351,12 @@ export function SettingsPage() {
                   <label className="block text-xs text-bambu-gray mb-1">
                     {t('settings.preheatSoak', 'Soak (seconds)')}
                   </label>
-                  <input
-                    type="number"
+                  <NumberInput
                     min={0}
                     max={1800}
                     value={localSettings.preheat_soak_seconds ?? 300}
-                    onChange={(e) => updateSetting('preheat_soak_seconds', Math.max(0, Math.min(1800, parseInt(e.target.value) || 0)))}
+                    onChange={(v) => updateSetting('preheat_soak_seconds', v)}
+                    fallback={0}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green disabled:opacity-50"
                     disabled={!(localSettings.preheat_enabled ?? false)}
                   />
@@ -4950,12 +5391,12 @@ export function SettingsPage() {
                   <label className="block text-xs text-bambu-gray mb-1">
                     {t('settings.keepWarmBedTemp', 'Keep-warm bed temperature (°C)')}
                   </label>
-                  <input
-                    type="number"
+                  <NumberInput
                     min={40}
                     max={110}
                     value={localSettings.queue_keep_warm_bed_temp ?? 90}
-                    onChange={(e) => updateSetting('queue_keep_warm_bed_temp', Math.max(40, Math.min(110, parseInt(e.target.value) || 90)))}
+                    onChange={(v) => updateSetting('queue_keep_warm_bed_temp', v)}
+                    fallback={90}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green disabled:opacity-50"
                     disabled={!(localSettings.preheat_enabled ?? false)}
                   />
@@ -4967,12 +5408,12 @@ export function SettingsPage() {
                   <label className="block text-xs text-bambu-gray mb-1">
                     {t('settings.keepWarmMaxMinutes', 'Stop keeping warm after (minutes)')}
                   </label>
-                  <input
-                    type="number"
+                  <NumberInput
                     min={5}
                     max={480}
                     value={localSettings.queue_keep_warm_max_minutes ?? 120}
-                    onChange={(e) => updateSetting('queue_keep_warm_max_minutes', Math.max(5, Math.min(480, parseInt(e.target.value) || 120)))}
+                    onChange={(v) => updateSetting('queue_keep_warm_max_minutes', v)}
+                    fallback={120}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green disabled:opacity-50"
                     disabled={!(localSettings.queue_keep_bed_warm ?? false) || !(localSettings.preheat_enabled ?? false) || !(localSettings.require_plate_clear ?? false)}
                   />
@@ -5309,12 +5750,66 @@ export function SettingsPage() {
                   <input
                     type="checkbox"
                     checked={localSettings.ambient_drying_enabled ?? false}
-                    onChange={(e) => updateSetting('ambient_drying_enabled', e.target.checked)}
+                    onChange={(e) => {
+                      setSustainedDraft(null);
+                      updateSetting('ambient_drying_enabled', e.target.checked);
+                    }}
                     className="sr-only peer"
                   />
                   <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
                 </label>
               </div>
+              {localSettings.ambient_drying_enabled && (
+                <div className="flex items-center justify-between">
+                  <div>
+                    <label className="block text-sm text-white">
+                      {t('settings.ambientDryingSustainedEnabled')}
+                    </label>
+                    <p className="text-xs text-bambu-gray mt-0.5">
+                      {t('settings.ambientDryingSustainedDescription')}
+                    </p>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={(localSettings.ambient_drying_sustained_minutes ?? 0) > 0}
+                      onChange={(e) => {
+                        setSustainedDraft(null);
+                        updateSetting('ambient_drying_sustained_minutes', e.target.checked ? 15 : 0);
+                      }}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                  </label>
+                </div>
+              )}
+              {localSettings.ambient_drying_enabled && (localSettings.ambient_drying_sustained_minutes ?? 0) > 0 && (
+                <div>
+                  <label className="block text-sm text-bambu-gray mb-1">
+                    {t('settings.ambientDryingSustainedMinutes')}
+                  </label>
+                  <input
+                    type="number"
+                    min="5"
+                    max="240"
+                    value={sustainedDraft ?? String(localSettings.ambient_drying_sustained_minutes ?? 15)}
+                    onChange={(e) => setSustainedDraft(e.target.value)}
+                    onBlur={(e) => {
+                      const parsed = parseInt(e.target.value, 10);
+                      if (!Number.isNaN(parsed)) {
+                        updateSetting('ambient_drying_sustained_minutes', Math.max(5, Math.min(240, parsed)));
+                      }
+                      setSustainedDraft(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        (e.currentTarget as HTMLInputElement).blur();
+                      }
+                    }}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
+                  />
+                </div>
+              )}
               <div className="flex items-center justify-between">
                 <div>
                   <label className="block text-sm text-white">
@@ -5379,8 +5874,8 @@ export function SettingsPage() {
                             <td className="py-1.5 pr-2 text-white font-medium">{fil}</td>
                             <td className="py-1 px-1">
                               <div className="flex items-center justify-end gap-1">
-                                <input type="number" min={30} max={65} value={preset.n3f}
-                                  onChange={e => updatePreset(fil, 'n3f', Math.max(1, parseInt(e.target.value) || 0))}
+                                <NumberInput min={30} max={65} value={preset.n3f}
+                                  onChange={v => updatePreset(fil, 'n3f', v)}
                                   className="w-14 px-1.5 py-1 bg-bambu-dark border border-bambu-dark-tertiary rounded text-white text-center text-xs focus:border-amber-500/50 focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                                 />
                                 <span className="text-bambu-gray">°C</span>
@@ -5388,8 +5883,8 @@ export function SettingsPage() {
                             </td>
                             <td className="py-1 px-1">
                               <div className="flex items-center gap-1">
-                                <input type="number" min={1} max={24} value={preset.n3f_hours}
-                                  onChange={e => updatePreset(fil, 'n3f_hours', Math.max(1, parseInt(e.target.value) || 0))}
+                                <NumberInput min={1} max={24} value={preset.n3f_hours}
+                                  onChange={v => updatePreset(fil, 'n3f_hours', v)}
                                   className="w-14 px-1.5 py-1 bg-bambu-dark border border-bambu-dark-tertiary rounded text-white text-center text-xs focus:border-amber-500/50 focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                                 />
                                 <span className="text-bambu-gray">h</span>
@@ -5397,8 +5892,8 @@ export function SettingsPage() {
                             </td>
                             <td className="py-1 px-1">
                               <div className="flex items-center justify-end gap-1">
-                                <input type="number" min={30} max={85} value={preset.n3s}
-                                  onChange={e => updatePreset(fil, 'n3s', Math.max(1, parseInt(e.target.value) || 0))}
+                                <NumberInput min={30} max={85} value={preset.n3s}
+                                  onChange={v => updatePreset(fil, 'n3s', v)}
                                   className="w-14 px-1.5 py-1 bg-bambu-dark border border-bambu-dark-tertiary rounded text-white text-center text-xs focus:border-amber-500/50 focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                                 />
                                 <span className="text-bambu-gray">°C</span>
@@ -5406,8 +5901,8 @@ export function SettingsPage() {
                             </td>
                             <td className="py-1 px-1">
                               <div className="flex items-center gap-1">
-                                <input type="number" min={1} max={24} value={preset.n3s_hours}
-                                  onChange={e => updatePreset(fil, 'n3s_hours', Math.max(1, parseInt(e.target.value) || 0))}
+                                <NumberInput min={1} max={24} value={preset.n3s_hours}
+                                  onChange={v => updatePreset(fil, 'n3s_hours', v)}
                                   className="w-14 px-1.5 py-1 bg-bambu-dark border border-bambu-dark-tertiary rounded text-white text-center text-xs focus:border-amber-500/50 focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                                 />
                                 <span className="text-bambu-gray">h</span>
@@ -5736,12 +6231,12 @@ export function SettingsPage() {
                         {t('settings.goodGreen')} ≤
                       </label>
                       <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          min="0"
-                          max="100"
+                        <NumberInput
+                          min={0}
+                          max={100}
                           value={localSettings.ams_humidity_good ?? 40}
-                          onChange={(e) => updateSetting('ams_humidity_good', parseInt(e.target.value) || 40)}
+                          onChange={(v) => updateSetting('ams_humidity_good', v)}
+                          fallback={40}
                           className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                         />
                         <span className="text-bambu-gray">%</span>
@@ -5752,12 +6247,12 @@ export function SettingsPage() {
                         {t('settings.fairOrange')} ≤
                       </label>
                       <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          min="0"
-                          max="100"
+                        <NumberInput
+                          min={0}
+                          max={100}
                           value={localSettings.ams_humidity_fair ?? 60}
-                          onChange={(e) => updateSetting('ams_humidity_fair', parseInt(e.target.value) || 60)}
+                          onChange={(v) => updateSetting('ams_humidity_fair', v)}
+                          fallback={60}
                           className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                         />
                         <span className="text-bambu-gray">%</span>
@@ -5795,13 +6290,14 @@ export function SettingsPage() {
                         {t('settings.goodBlue')} ≤
                       </label>
                       <div className="flex items-center gap-2">
-                        <input
-                          type="number"
+                        <NumberInput
                           step="0.5"
-                          min="0"
-                          max="60"
+                          min={0}
+                          max={60}
                           value={localSettings.ams_temp_good ?? 28}
-                          onChange={(e) => updateSetting('ams_temp_good', parseFloat(e.target.value) || 28)}
+                          onChange={(v) => updateSetting('ams_temp_good', v)}
+                          integer={false}
+                          fallback={28}
                           className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                         />
                         <span className="text-bambu-gray">°C</span>
@@ -5812,13 +6308,14 @@ export function SettingsPage() {
                         {t('settings.fairOrange')} ≤
                       </label>
                       <div className="flex items-center gap-2">
-                        <input
-                          type="number"
+                        <NumberInput
                           step="0.5"
-                          min="0"
-                          max="60"
+                          min={0}
+                          max={60}
                           value={localSettings.ams_temp_fair ?? 35}
-                          onChange={(e) => updateSetting('ams_temp_fair', parseFloat(e.target.value) || 35)}
+                          onChange={(v) => updateSetting('ams_temp_fair', v)}
+                          integer={false}
+                          fallback={35}
                           className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                         />
                         <span className="text-bambu-gray">°C</span>
@@ -5827,6 +6324,47 @@ export function SettingsPage() {
                   </div>
                   <p className="text-xs text-bambu-gray">
                     {t('settings.aboveFairHot')}
+                  </p>
+                  {/* Below the band's own help text, so that line still reads as
+                      describing Fair rather than this field. The comparison lives
+                      in the label string here, not appended as a symbol like the
+                      two above -- most locales word it as "Alarm above", which
+                      would read doubled next to a `>`. */}
+                  <div>
+                    <label className="block text-sm text-bambu-gray mb-1">
+                      {t('settings.tempAlarmThreshold')}
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        step="0.5"
+                        min="0.5"
+                        max="120"
+                        value={localSettings.ams_temp_alarm ?? ''}
+                        placeholder={String(localSettings.ams_temp_fair ?? 35)}
+                        onChange={(e) => {
+                          const raw = e.target.value.trim();
+                          const parsed = parseFloat(raw);
+                          updateSetting('ams_temp_alarm', raw === '' || Number.isNaN(parsed) ? null : parsed);
+                        }}
+                        className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
+                      />
+                      <span className="text-bambu-gray">°C</span>
+                    </div>
+                  </div>
+                  {/* Warn rather than clamp, for the same reason the humidity
+                      floor above does: clamping a controlled input mid-keystroke
+                      makes "0.5" untypeable, because the "0" would blank the
+                      field before the ".5" arrives. The backend refuses a
+                      non-positive threshold and falls back to Fair, so say so
+                      instead of pretending min= stopped it (#2905). */}
+                  {(localSettings.ams_temp_alarm ?? 1) <= 0 && (
+                    <p className="text-xs text-red-600 dark:text-red-400">
+                      {t('settings.tempAlarmMustBePositive')}
+                    </p>
+                  )}
+                  <p className="text-xs text-amber-700/80 dark:text-amber-400/70">
+                    {t('settings.tempAlarmSeparateFromBand')}
                   </p>
                 </div>
 
@@ -5841,12 +6379,12 @@ export function SettingsPage() {
                       {t('settings.keepSensorHistory')}
                     </label>
                     <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min="1"
-                        max="365"
+                      <NumberInput
+                        min={1}
+                        max={365}
                         value={localSettings.ams_history_retention_days ?? 30}
-                        onChange={(e) => updateSetting('ams_history_retention_days', parseInt(e.target.value) || 30)}
+                        onChange={(v) => updateSetting('ams_history_retention_days', v)}
+                        fallback={30}
                         className="w-24 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                       />
                       <span className="text-bambu-gray">{t('common.days')}</span>
@@ -5905,6 +6443,35 @@ export function SettingsPage() {
             setShowHASensorModal(false);
             setEditingHASensor(null);
           }}
+        />
+      )}
+
+      {showLocationHASensorModal && (
+        <LocationHASensorModal
+          sensor={editingLocationHASensor}
+          locations={haSensorLocations ?? []}
+          onClose={() => {
+            setShowLocationHASensorModal(false);
+            setEditingLocationHASensor(null);
+          }}
+        />
+      )}
+
+      {showLocationSensorOptionsModal && (
+        <LocationSensorOptionsModal onClose={() => setShowLocationSensorOptionsModal(false)} />
+      )}
+
+      {deleteLocationSensorsTarget && (
+        <ConfirmModal
+          title={t('locationHaSensors.deleteAllConfirm.title')}
+          message={t('locationHaSensors.deleteAllConfirm.message', {
+            location: deleteLocationSensorsTarget.locationName,
+            count: deleteLocationSensorsTarget.sensorIds.length,
+          })}
+          variant="danger"
+          isLoading={deleteLocationSensorsMutation.isPending}
+          onConfirm={() => deleteLocationSensorsMutation.mutate(deleteLocationSensorsTarget.sensorIds)}
+          onCancel={() => setDeleteLocationSensorsTarget(null)}
         />
       )}
 

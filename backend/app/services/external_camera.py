@@ -8,6 +8,7 @@ to ensure they are well-formed before use.
 """
 
 import asyncio
+import contextlib
 import functools
 import ipaddress
 import logging
@@ -21,6 +22,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from backend.app.core.logging_filters import redact_url_credentials
+from backend.app.utils.ffmpeg_output import NO_FFMPEG_OUTPUT, summarize_ffmpeg_stderr
 
 logger = logging.getLogger(__name__)
 
@@ -517,7 +519,7 @@ async def _capture_usb_frame(device: str, timeout: int) -> bytes | None:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
 
         if process.returncode != 0:
-            logger.error("ffmpeg USB capture failed: %s", stderr.decode()[:200])
+            logger.error("ffmpeg USB capture failed: %s", summarize_ffmpeg_stderr(stderr) or NO_FFMPEG_OUTPUT)
             return None
 
         if not stdout or len(stdout) < 100:
@@ -642,7 +644,7 @@ async def _capture_rtsp_frame(url: str, timeout: int) -> bytes | None:
         try:
             from urllib.parse import urlparse
 
-            from backend.app.services.camera import create_tls_proxy
+            from backend.app.services.camera import close_tls_proxy, create_tls_proxy
 
             parsed = urlparse(safe_url)
             target_port = parsed.port or 322
@@ -701,8 +703,8 @@ async def _capture_rtsp_frame(url: str, timeout: int) -> bytes | None:
         )
 
         if process.returncode != 0:
-            # ffmpeg echoes the RTSP input URL, which carries the camera password.
-            logger.error("ffmpeg RTSP capture failed: %s", redact_url_credentials(stderr.decode())[:200])
+            # The summariser masks the camera password the input URL carries.
+            logger.error("ffmpeg RTSP capture failed: %s", summarize_ffmpeg_stderr(stderr) or NO_FFMPEG_OUTPUT)
             return None
 
         if not stdout or len(stdout) < 100:
@@ -721,8 +723,7 @@ async def _capture_rtsp_frame(url: str, timeout: int) -> bytes | None:
         return None
     finally:
         if proxy_server:
-            proxy_server.close()
-            await proxy_server.wait_closed()
+            await close_tls_proxy(proxy_server)
 
 
 def _transcode_to_jpeg(data: bytes) -> bytes | None:
@@ -921,42 +922,55 @@ async def generate_mjpeg_stream(
                 logger.exception("on_frame callback raised")
         return _format_mjpeg_frame(frame)
 
-    if camera_type == "mjpeg":
-        # Proxy MJPEG stream directly, with reconnect on timeout
-        max_retries = 3
-        for attempt in range(max_retries + 1):
+    async def _reconnecting(open_session, label: str):
+        """Yield frames across sessions, reconnecting after each that delivered.
+
+        A session that ends without a single frame stops the stream: the
+        source is down, and retrying is the viewer's call. One that delivered
+        frames and then ended is a routine drop and is always reconnected.
+        This used to be three reconnects for the life of the stream, so a
+        server that closes its sessions periodically ended the stream for good
+        on the fourth drop, however long each session had run -- the external
+        twin of the built-in RTSP path's lifetime reconnect budget.
+        """
+        drops = 0
+        while True:
             frame_yielded = False
-            async for frame in _stream_mjpeg(url):
-                frame_yielded = True
+            # aclosing: stop the session's ffmpeg the moment this generator is
+            # closed, rather than whenever the abandoned iterator is collected.
+            async with contextlib.aclosing(open_session()) as session:
+                async for frame in session:
+                    frame_yielded = True
+                    yield frame
+            if not frame_yielded or (stop_event is not None and stop_event.is_set()):
+                break
+            # The sessions swallow CancelledError and simply end, so a viewer
+            # whose task was cancelled mid-read looks like a routine drop here.
+            # Never redial for a task that is being cancelled (Task.cancelling
+            # is 3.11+; without it this falls back to the next await raising).
+            task = asyncio.current_task()
+            if task is not None and getattr(task, "cancelling", lambda: 0)():
+                break
+            drops += 1
+            logger.warning("External %s stream ended, reconnecting (drop %d)...", label, drops)
+            await asyncio.sleep(2)
+
+    if camera_type == "mjpeg":
+        # Proxy MJPEG stream directly, reconnecting after routine drops.
+        async with contextlib.aclosing(_reconnecting(lambda: _stream_mjpeg(url), "MJPEG")) as frames:
+            async for frame in frames:
                 current_time = asyncio.get_event_loop().time()
                 if current_time - last_frame_time >= frame_interval:
                     last_frame_time = current_time
                     yield _publish(frame)
-            if not frame_yielded or attempt == max_retries or (stop_event is not None and stop_event.is_set()):
-                break
-            logger.warning(
-                "External MJPEG stream ended, reconnecting (attempt %d/%d)...",
-                attempt + 1,
-                max_retries,
-            )
-            await asyncio.sleep(2)
 
     elif camera_type == "rtsp":
-        # Use ffmpeg to convert RTSP to MJPEG, with reconnect on timeout
-        max_retries = 3
-        for attempt in range(max_retries + 1):
-            frame_yielded = False
-            async for frame in _stream_rtsp(url, fps, on_process=on_process):
-                frame_yielded = True
+        # Use ffmpeg to convert RTSP to MJPEG, reconnecting after routine drops.
+        async with contextlib.aclosing(
+            _reconnecting(lambda: _stream_rtsp(url, fps, on_process=on_process), "RTSP")
+        ) as frames:
+            async for frame in frames:
                 yield _publish(frame)
-            if not frame_yielded or attempt == max_retries or (stop_event is not None and stop_event.is_set()):
-                break
-            logger.warning(
-                "External RTSP stream ended, reconnecting (attempt %d/%d)...",
-                attempt + 1,
-                max_retries,
-            )
-            await asyncio.sleep(2)
 
     elif camera_type == "usb":
         # Use ffmpeg to stream from USB camera
@@ -1075,7 +1089,7 @@ async def _stream_rtsp(
         try:
             from urllib.parse import urlparse
 
-            from backend.app.services.camera import create_tls_proxy
+            from backend.app.services.camera import close_tls_proxy, create_tls_proxy
 
             parsed = urlparse(safe_url)
             target_port = parsed.port or 322
@@ -1112,10 +1126,18 @@ async def _stream_rtsp(
         "1024000",
         "-max_delay",
         "500000",
-        "-probesize",
-        "32",
-        "-analyzeduration",
-        "0",
+        # No probe cap here (#3082). The input is whatever camera the user
+        # owns, so there is no stream to tune a fast-start probe against: a
+        # 32-byte probe expires before a source that carries SPS/PPS in-band
+        # rather than in its SDP has sent them, and ffmpeg then starts no
+        # H.264 decoder and emits nothing at all. ffmpeg's defaults are a
+        # ceiling rather than a wait, so a camera that announces itself in the
+        # first packet still starts as fast as it ever did.
+        #
+        # `_capture_rtsp_frame` has always run on those defaults, which is how
+        # a camera could pass the connection test and still show a black live
+        # view. The printer path is the opposite case — a known Bambu camera
+        # per model — and keeps its tuning in `camera_profiles.py`.
         "-fflags",
         "nobuffer",
         "-flags",
@@ -1149,8 +1171,10 @@ async def _stream_rtsp(
         await asyncio.sleep(0.1)
         if process.returncode is not None:
             stderr = await process.stderr.read()
-            # ffmpeg echoes the RTSP input URL, which carries the camera password.
-            logger.error("ffmpeg RTSP stream failed immediately: %s", redact_url_credentials(stderr.decode())[:300])
+            # The summariser masks the camera password the input URL carries.
+            logger.error(
+                "ffmpeg RTSP stream failed immediately: %s", summarize_ffmpeg_stderr(stderr) or NO_FFMPEG_OUTPUT
+            )
             return
 
         buffer = b""
@@ -1201,8 +1225,7 @@ async def _stream_rtsp(
                 process.kill()
                 await process.wait()
         if proxy_server:
-            proxy_server.close()
-            await proxy_server.wait_closed()
+            await close_tls_proxy(proxy_server)
 
 
 async def _stream_usb(
@@ -1262,7 +1285,9 @@ async def _stream_usb(
         await asyncio.sleep(0.5)
         if process.returncode is not None:
             stderr = await process.stderr.read()
-            logger.error("ffmpeg USB stream failed immediately: %s", stderr.decode()[:300])
+            logger.error(
+                "ffmpeg USB stream failed immediately: %s", summarize_ffmpeg_stderr(stderr) or NO_FFMPEG_OUTPUT
+            )
             return
 
         buffer = b""

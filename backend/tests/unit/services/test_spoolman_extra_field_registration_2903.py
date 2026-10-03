@@ -22,6 +22,24 @@ import pytest
 from backend.app.services.spoolman import AMSTray, SpoolmanClient
 
 
+class _NoCatalog:
+    """A DB session whose colour catalogue has no row for anything.
+
+    ``_find_or_create_filament`` resolves the expected colour name from the
+    catalogue now (#2907), so it needs a session. These tests predate the
+    catalogue and were written against the state where it cannot name the
+    colour, which is this. Tests that care about the name pass a real session.
+    """
+
+    async def execute(self, *_args, **_kwargs):
+        class _Result:
+            @staticmethod
+            def scalar_one_or_none():
+                return None
+
+        return _Result()
+
+
 class FakeSpoolman:
     """A Spoolman that rejects unregistered extra keys, the way the real one does."""
 
@@ -49,12 +67,26 @@ class FakeSpoolman:
         self.log.append(f"{request.method} {path}")
         body = json.loads(request.content) if request.content else {}
 
+        if path == "/field/spool" and request.method == "GET":
+            if self.field_status != 200:
+                return httpx.Response(self.field_status)
+            return httpx.Response(
+                200,
+                json=[
+                    {"key": name, "name": name, "field_type": "text", "entity_type": "spool"}
+                    for name in sorted(self.registered)
+                ],
+            )
+
         if path.startswith("/field/spool/"):
             name = path.rsplit("/", 1)[-1]
-            if request.method == "GET":
-                if self.field_status != 200:
-                    return httpx.Response(self.field_status)
-                return httpx.Response(200) if name in self.registered else httpx.Response(404)
+            # Spoolman declares only POST and DELETE here -- its own OpenAPI
+            # document says so, and the live server answers 405. Modelling this
+            # as a working existence probe is what let the bug in issue #2983
+            # sit unnoticed: the check could never succeed, and the POST that
+            # followed silently overwrote whatever the user had customised.
+            if request.method != "POST":
+                return httpx.Response(405, json={"detail": "Method Not Allowed"})
             if self.field_status != 200:
                 return httpx.Response(self.field_status)
             self.registered.add(name)
@@ -93,7 +125,9 @@ class FakeSpoolman:
         return httpx.Response(200, json=[])
 
     def field_calls(self, name: str) -> list[str]:
-        return [entry for entry in self.log if entry.endswith(f"/field/spool/{name}")]
+        """Every request this client made about ``name``: the listing read that
+        answers "does it exist", plus any creation of that specific field."""
+        return [entry for entry in self.log if entry == "GET /field/spool" or entry.endswith(f"/field/spool/{name}")]
 
 
 def _client(fake: FakeSpoolman) -> SpoolmanClient:
@@ -125,7 +159,7 @@ class TestTheReportedCase:
         fake = FakeSpoolman()  # GET /field/spool returns nothing: no custom fields at all
         client = _client(fake)
 
-        result = await client.sync_ams_tray(_tray("D144798DEF394926ACAE9D69ABA910CC"), "OJIMPO-X2D-01")
+        result = await client.sync_ams_tray(_tray("D144798DEF394926ACAE9D69ABA910CC"), "OJIMPO-X2D-01", _NoCatalog())
 
         assert result is not None, "spool creation was rejected -- this is the reported 400"
         assert result["extra"]["tag"] == json.dumps("D144798DEF394926ACAE9D69ABA910CC")
@@ -142,7 +176,7 @@ class TestTheReportedCase:
             "1D1F3C49046246DBBADBC3631B7F1B61",
         ]
 
-        synced = [await client.sync_ams_tray(_tray(tag), "OJIMPO-X2D-01") for tag in tags]
+        synced = [await client.sync_ams_tray(_tray(tag), "OJIMPO-X2D-01", _NoCatalog()) for tag in tags]
 
         assert all(s is not None for s in synced)
         assert [s["extra"]["tag"] for s in synced] == [json.dumps(t) for t in tags]
@@ -167,7 +201,7 @@ class TestItAsksSpoolmanOnlyOnce:
         await client.create_spool(filament_id=7, extra={"tag": json.dumps("A")})
         await client.create_spool(filament_id=7, extra={"tag": json.dumps("B")})
 
-        assert fake.field_calls("tag") == ["GET /field/spool/tag", "POST /field/spool/tag"]
+        assert fake.field_calls("tag") == ["GET /field/spool", "POST /field/spool/tag"]
 
     @pytest.mark.asyncio
     async def test_an_already_registered_field_is_never_created(self):
@@ -176,7 +210,7 @@ class TestItAsksSpoolmanOnlyOnce:
 
         await client.create_spool(filament_id=7, extra={"tag": json.dumps("A")})
 
-        assert fake.field_calls("tag") == ["GET /field/spool/tag"]
+        assert fake.field_calls("tag") == ["GET /field/spool"]
 
     @pytest.mark.asyncio
     async def test_a_write_carrying_no_extra_asks_nothing(self):
@@ -204,7 +238,7 @@ class TestItAsksSpoolmanOnlyOnce:
             client.create_spool(filament_id=7, extra={"tag": json.dumps("B")}),
         )
 
-        assert fake.field_calls("tag") == ["GET /field/spool/tag", "POST /field/spool/tag"]
+        assert fake.field_calls("tag") == ["GET /field/spool", "POST /field/spool/tag"]
 
     @pytest.mark.asyncio
     async def test_another_client_does_not_inherit_the_answer(self):
@@ -215,7 +249,7 @@ class TestItAsksSpoolmanOnlyOnce:
         second_fake = FakeSpoolman()
         await _client(second_fake).create_spool(filament_id=7, extra={"tag": json.dumps("B")})
 
-        assert "GET /field/spool/tag" in second_fake.log
+        assert "GET /field/spool" in second_fake.log
 
 
 class TestEveryWritePathThatCarriesExtra:

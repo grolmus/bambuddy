@@ -27,6 +27,7 @@ const mockSettings = {
   ams_humidity_fair: 60,
   ams_temp_good: 30,
   ams_temp_fair: 35,
+  ams_temp_alarm: null,
   time_format: 'system',
   date_format: 'system',
   mqtt_enabled: false,
@@ -771,6 +772,94 @@ describe('SettingsPage', () => {
 
       expect(screen.queryByText(/Auto-drying cannot reach this value/)).not.toBeInTheDocument();
     });
+
+    // #2905: the alarm threshold is a separate value from the Fair display
+    // band, and unset means "use Fair" rather than "never alarm". Everything
+    // below turns on telling those two apart.
+    const openFilamentTabWith = async (overrides: Record<string, unknown>) => {
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({ ...mockSettings, ...overrides }))
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Filament').length).toBeGreaterThan(0);
+      });
+      await user.click(screen.getAllByText('Filament')[0]);
+      await waitFor(() => {
+        expect(screen.getByText('AMS Display Thresholds')).toBeInTheDocument();
+      });
+    };
+
+    const alarmInput = () =>
+      within(screen.getByText('Alarm above').parentElement!).getByRole('spinbutton');
+
+    it('shows the fair threshold as the placeholder while the alarm threshold is unset', async () => {
+      // The fallback has to be visible in the field itself. Blank with no hint
+      // reads as "no alarm", which is the opposite of what unset does.
+      await openFilamentTabWith({ ams_temp_fair: 38, ams_temp_alarm: null });
+
+      const input = alarmInput();
+      expect(input).toHaveValue(null);
+      expect(input).toHaveAttribute('placeholder', '38');
+    });
+
+    it('sends the typed alarm threshold on save', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      await openFilamentTabWith({ ams_temp_alarm: null });
+      // The page suppresses auto-save for 100ms after the settings load.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await userEvent.type(alarmInput(), '45');
+
+      // Assert on the value rather than merely on a save having happened: two
+      // keystrokes can straddle the 500ms debounce on a slow runner, and the
+      // first save would then carry 4. Waiting for 45 rides that out.
+      await waitFor(() => {
+        expect(saved?.ams_temp_alarm).toBe(45);
+      }, { timeout: 3000 });
+    });
+
+    it('sends null when the alarm threshold is cleared', async () => {
+      // The one path the backend tests cannot reach on their own: clearing has
+      // to send an explicit null, not omit the key, or the old threshold stays.
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      await openFilamentTabWith({ ams_temp_alarm: 45 });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await userEvent.clear(alarmInput());
+
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+        expect(saved!.ams_temp_alarm).toBeNull();
+      }, { timeout: 3000 });
+    });
+
+    it('warns that a non-positive alarm threshold is ignored', async () => {
+      // The backend refuses <= 0 and falls back to Fair. Saying so beats a min=
+      // attribute the browser only enforces on submit.
+      await openFilamentTabWith({ ams_temp_alarm: 0 });
+
+      expect(await screen.findByText(/A threshold of 0 or less is ignored/)).toBeInTheDocument();
+    });
+
+    it('stays quiet for an alarm threshold the backend will honour', async () => {
+      await openFilamentTabWith({ ams_temp_alarm: 45 });
+
+      expect(screen.queryByText(/A threshold of 0 or less is ignored/)).not.toBeInTheDocument();
+    });
   });
 
   describe('Workflow tab', () => {
@@ -876,6 +965,118 @@ describe('SettingsPage', () => {
 
       await waitFor(() => {
         expect(screen.getByText(/overridden per print in the print dialog/)).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('sustained-minutes input drafts while typing (#2518)', () => {
+    const openWorkflowTab = async (user: ReturnType<typeof userEvent.setup>) => {
+      render(<SettingsPage />);
+      await waitFor(() => {
+        expect(screen.getByText('Workflow')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Workflow'));
+      await waitFor(() => {
+        expect(screen.getByText('Queue Auto-Drying')).toBeInTheDocument();
+      });
+      // 15 is unique to this input in the mock settings below
+      return screen.getByDisplayValue('15') as HTMLInputElement;
+    };
+
+    beforeEach(() => {
+      server.use(
+        http.get('/api/v1/settings/', () => {
+          return HttpResponse.json({
+            ...mockSettings,
+            ambient_drying_enabled: true,
+            ambient_drying_sustained_minutes: 15,
+          });
+        })
+      );
+    });
+
+    it('seeds a new sustained wait at 15 minutes when enabled from off', async () => {
+      const user = userEvent.setup();
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({
+            ...mockSettings,
+            ambient_drying_enabled: true,
+            ambient_drying_sustained_minutes: 0,
+          })
+        ),
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+
+      render(<SettingsPage />);
+      await user.click(await screen.findByText('Workflow'));
+      const label = await screen.findByText('Require sustained humidity');
+      const row = label.closest('div')!.parentElement!;
+      const toggle = within(row).getByRole('checkbox');
+      expect(toggle).not.toBeChecked();
+
+      // Wait out the page's initial-load save suppression before toggling.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await user.click(toggle);
+
+      expect(toggle).toBeChecked();
+      expect(screen.getByDisplayValue('15')).toBeInTheDocument();
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+      }, { timeout: 3000 });
+      expect(saved!.ambient_drying_sustained_minutes).toBe(15);
+    });
+
+    it('clearing the field does not snap it to a value mid-edit', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      // The old per-keystroke clamp rewrote '' to 10 immediately.
+      expect(input.value).toBe('');
+    });
+
+    it('intermediate below-minimum digits are not rewritten while typing', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      await user.type(input, '2');
+      // The old clamp turned the '2' (on the way to '25') into 5.
+      expect(input.value).toBe('2');
+      await user.type(input, '5');
+      expect(input.value).toBe('25');
+
+      await user.tab();
+      await waitFor(() => {
+        expect(input.value).toBe('25');
+      });
+    });
+
+    it('blur with an empty field reverts to the saved value instead of inventing one', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      await user.tab();
+      await waitFor(() => {
+        expect(input.value).toBe('15');
+      });
+    });
+
+    it('still clamps an out-of-range value on blur', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      await user.type(input, '500');
+      await user.tab();
+      await waitFor(() => {
+        expect(input.value).toBe('240');
       });
     });
   });
@@ -1527,6 +1728,318 @@ describe('SettingsPage', () => {
         expect(window.location.search).toContain('sub=pipelines');
       });
     });
+  });
+
+  // --------------------------------------------------------------------
+  // Ask for the outcome of prints Bambuddy did not start (#1898)
+  // --------------------------------------------------------------------
+  describe('outcome prompt for external prints (#1898)', () => {
+    const externalLabel = 'Also ask for prints started outside Bambuddy';
+
+    const openDefaultPrintOptions = async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Workflow' })).toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: 'Workflow' }));
+      return user;
+    };
+
+    it('offers the toggle alongside the per-job outcome default', async () => {
+      await openDefaultPrintOptions();
+
+      expect(await screen.findByText(externalLabel)).toBeInTheDocument();
+      expect(screen.getByText('Ask for Outcome')).toBeInTheDocument();
+    });
+
+    it('shows it off when the backend has no value for it', async () => {
+      // Default false: an install that never touches it keeps today's
+      // behaviour, where only queued prints are asked about.
+      await openDefaultPrintOptions();
+
+      const label = await screen.findByText(externalLabel);
+      const row = label.closest('div')!.parentElement!;
+      expect(within(row).getByRole('checkbox')).not.toBeChecked();
+    });
+
+    it('sends the new value on save', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      const user = await openDefaultPrintOptions();
+
+      const label = await screen.findByText(externalLabel);
+      // The page suppresses auto-save for 100ms after the settings load.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const row = label.closest('div')!.parentElement!;
+      await user.click(within(row).getByRole('checkbox'));
+
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+      }, { timeout: 3000 });
+      expect(saved!.confirm_outcome_external_prints).toBe(true);
+    });
+
+    it('reflects a value the backend already has', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({ ...mockSettings, confirm_outcome_external_prints: true })
+        )
+      );
+      await openDefaultPrintOptions();
+
+      const label = await screen.findByText(externalLabel);
+      const row = label.closest('div')!.parentElement!;
+      expect(within(row).getByRole('checkbox')).toBeChecked();
+    });
+  });
+
+  // --------------------------------------------------------------------
+  // The plate-clear default answers outcome prompts on its own (#1898), so
+  // its help text has to name that consequence — the farm case was a user
+  // who had it on and could not work out why Telegram said "already used".
+  // --------------------------------------------------------------------
+  describe('plate-clear outcome default help text (#1898)', () => {
+    it('warns that a later Telegram or link answer only shows the result', async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Workflow' })).toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: 'Workflow' }));
+
+      const label = await screen.findByText('Count unanswered outcomes as good on plate release');
+      const row = label.closest('div')!;
+      expect(row).toHaveTextContent(
+        /a Telegram or link answer after that only shows the recorded result/i,
+      );
+    });
+  });
+});
+
+/**
+ * Location sensor cards on Settings -> Sensors read the live readings
+ * endpoint (reachable-aware) rather than the sensor row's last_state, so an
+ * entity Home Assistant has stopped reporting shows "Unavailable" instead of
+ * silently keeping its last colorized value on screen forever.
+ */
+describe('SettingsPage — location sensor reachability', () => {
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/');
+  });
+
+  const locationSensor = {
+    id: 1,
+    location_id: 7,
+    name: 'Drybox 1 Temperature',
+    entity_id: 'sensor.drybox_1_temperature',
+    kind: 'numeric',
+    device_class: 'temperature',
+    unit: '°C',
+    alert_state: null,
+    alert_above: 30,
+    alert_below: 20,
+    notify_on_alert: false,
+    show_on_card: true,
+    sort_order: 0,
+    last_state: '65.0',
+    last_changed: null,
+    last_checked: null,
+    created_at: '',
+    updated_at: '',
+  };
+
+  it('shows "Unavailable" for an unreachable sensor instead of its stale last value', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () =>
+        HttpResponse.json([
+          {
+            id: 1,
+            name: 'Drybox 1 Temperature',
+            entity_id: 'sensor.drybox_1_temperature',
+            kind: 'numeric',
+            device_class: 'temperature',
+            unit: '°C',
+            state: null,
+            value: null,
+            alerting: false,
+            reachable: false,
+            alert_state: null,
+            alert_above: 30,
+            alert_below: 20,
+            last_changed: null,
+          },
+        ])
+      ),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+
+    expect(await screen.findByText('Unavailable')).toBeInTheDocument();
+    expect(screen.queryByText('65.00 °C')).not.toBeInTheDocument();
+  });
+
+  it('shows the live value, not last_state, when the sensor is reachable', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () =>
+        HttpResponse.json([
+          {
+            id: 1,
+            name: 'Drybox 1 Temperature',
+            entity_id: 'sensor.drybox_1_temperature',
+            kind: 'numeric',
+            device_class: 'temperature',
+            unit: '°C',
+            state: '24.5',
+            value: 24.5,
+            alerting: false,
+            reachable: true,
+            alert_state: null,
+            alert_above: 30,
+            alert_below: 20,
+            last_changed: null,
+          },
+        ])
+      ),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+
+    expect(await screen.findByText('24.50 °C')).toBeInTheDocument();
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument();
+  });
+
+  it('shows the entity id in the overview row, with the display name as its hover title', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+
+    const entityIdText = await screen.findByText('sensor.drybox_1_temperature');
+    expect(entityIdText).toHaveAttribute('title', 'Drybox 1 Temperature');
+    expect(screen.queryByText('Drybox 1 Temperature')).not.toBeInTheDocument();
+  });
+
+  it('refreshes the sensor list even when a bulk delete partially fails', async () => {
+    let sensors = [
+      { ...locationSensor, id: 1, name: 'Drybox 1 Temperature' },
+      {
+        ...locationSensor,
+        id: 2,
+        name: 'Drybox 1 Humidity',
+        entity_id: 'sensor.drybox_1_humidity',
+        device_class: 'humidity',
+        unit: '%',
+      },
+    ];
+
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json(sensors)),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      ),
+      // The first delete succeeds and actually removes the row; the second
+      // fails, simulating a partial failure partway through the sequential
+      // delete loop.
+      http.delete('/api/v1/location-ha-sensors/1', () => {
+        sensors = sensors.filter((s) => s.id !== 1);
+        return HttpResponse.json({ message: 'Sensor removed' });
+      }),
+      http.delete('/api/v1/location-ha-sensors/2', () => new HttpResponse(null, { status: 500 }))
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+    await screen.findByText('sensor.drybox_1_humidity');
+
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+
+    // The sensor that actually got deleted on the backend must not linger on
+    // screen just because the batch as a whole reported an error.
+    await waitFor(() => expect(screen.queryByText('sensor.drybox_1_temperature')).not.toBeInTheDocument());
+    expect(screen.getByText('sensor.drybox_1_humidity')).toBeInTheDocument();
+  });
+
+  it('orders location cards by location, not by the order their sensors were created', async () => {
+    // Sensor for location 8 ("Drybox 10") appears in the array before the
+    // sensor for location 7 ("Drybox 2") — a naive Map-insertion-order
+    // render would put "Drybox 10" first. Card order must follow the
+    // (naturally sorted) locations list instead.
+    const sensors = [
+      {
+        id: 1,
+        location_id: 8,
+        name: 'Drybox 10 Temperature',
+        entity_id: 'sensor.drybox_10_temperature',
+        device_class: 'temperature',
+        unit: '°C',
+      },
+      {
+        id: 2,
+        location_id: 7,
+        name: 'Drybox 2 Temperature',
+        entity_id: 'sensor.drybox_2_temperature',
+        device_class: 'temperature',
+        unit: '°C',
+      },
+    ];
+
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json(sensors)),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/location-ha-sensors/by-location/8/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([
+          { id: 7, name: 'Drybox 2', identifier: null, spool_count: 0, created_at: '', updated_at: '' },
+          { id: 8, name: 'Drybox 10', identifier: null, spool_count: 0, created_at: '', updated_at: '' },
+        ])
+      )
+    );
+
+    const user = userEvent.setup();
+    const { container } = render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_10_temperature');
+
+    const cardTitles = Array.from(container.querySelectorAll('.text-white.font-medium.truncate')).map(
+      (el) => el.textContent
+    );
+    const drybox2Index = cardTitles.indexOf('Drybox 2');
+    const drybox10Index = cardTitles.indexOf('Drybox 10');
+    expect(drybox2Index).toBeGreaterThanOrEqual(0);
+    expect(drybox10Index).toBeGreaterThanOrEqual(0);
+    expect(drybox2Index).toBeLessThan(drybox10Index);
   });
 });
 
